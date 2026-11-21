@@ -52,6 +52,14 @@ function fmtTime(iso) {
 }
 function shortID(id) { return id ? id.slice(0, 8) : ""; }
 function esc(s) { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; }
+function statusLabel(st) {
+  return { connected: "已连接", connecting: "连接中", online: "在线", reachable: "可连接", offline: "离线" }[st] || st;
+}
+function platformBadge(platform, version) {
+  if (!platform) return "";
+  const v = version ? " · v" + esc(version) : "";
+  return ` <span class="p-badge">${esc(platform)}${v}</span>`;
+}
 
 // ---------------------------------------------------------------- state ---
 
@@ -109,7 +117,7 @@ function connectEvents() {
   es = new EventSource("/api/events?t=" + encodeURIComponent(TOKEN));
   es.onmessage = (m) => {
     let ev; try { ev = JSON.parse(m.data); } catch { return; }
-    if (ev.type === "peer_up" || ev.type === "peer_down") {
+    if (ev.type === "peer_up" || ev.type === "peer_down" || ev.type === "peer_connecting") {
       refreshStatus();
       if (ev.type === "peer_down") dropTermForPeer(ev.peer_id);
     } else if (ev.type === "xfer") {
@@ -174,20 +182,20 @@ function renderDevices() {
     $("#invite-btn").addEventListener("click", makeInvite);
   }
 
-  // peers
-  const connected = new Map((s.connected || []).map((c) => [c.id, c]));
+  // peers — status comes from the server (device.Aggregate), no client join
   const list = $("#peer-list");
   list.innerHTML = "";
   const peers = s.peers || [];
   if (!peers.length) list.innerHTML = `<div class="empty">还没有配对设备，用上面的配对码完成首次配对。</div>`;
   for (const p of peers) {
-    const on = connected.has(p.id);
+    const st = p.status || "offline";
+    const on = st === "connected";
     const row = document.createElement("div");
-    row.className = "peer-row" + (on ? " online" : "");
+    row.className = "peer-row st-" + st;
     row.innerHTML = `
       <span class="dot"></span>
-      <div class="p-name">${esc(p.name)}</div>
-      <div class="p-meta mono">${shortID(p.id)}${p.last_addr ? " · " + esc(p.last_addr) : ""}${p.last_seen ? " · " + fmtTime(p.last_seen) : ""}</div>
+      <div class="p-name">${esc(p.name)}${platformBadge(p.platform, p.version)}</div>
+      <div class="p-meta mono">${shortID(p.id)}${p.last_addr ? " · " + esc(p.last_addr) : ""}${p.last_seen ? " · " + fmtTime(p.last_seen) : ""}${st !== "connected" && st !== "offline" ? " · " + esc(statusLabel(st)) : ""}</div>
       <div class="p-actions"></div>`;
     const act = row.querySelector(".p-actions");
     const btn = document.createElement("button");
@@ -233,7 +241,7 @@ function renderDevices() {
     row.className = "peer-row";
     row.innerHTML = `
       <span class="dot" style="background:var(--acc)"></span>
-      <div class="p-name">${esc(d.name || "未命名")}</div>
+      <div class="p-name">${esc(d.name || "未命名")}${platformBadge(d.platform, "")}</div>
       <div class="p-meta mono">${shortID(d.id)} · ${esc(d.addr)}</div>
       <div class="p-actions"><button class="btn small primary">填入配对</button></div>`;
     row.querySelector("button").addEventListener("click", () => {
@@ -599,7 +607,7 @@ async function refreshFwd() {
       const active = (res.active || {})[r.id];
       const peer = (state.status?.peers || []).find((p) => p.id === r.peer_id);
       const row = document.createElement("div");
-      row.className = "peer-row" + (active ? " online" : "");
+      row.className = "peer-row" + (active ? " st-connected" : "");
       row.innerHTML = `
         <span class="dot"></span>
         <div class="p-name">-${r.mode}</div>

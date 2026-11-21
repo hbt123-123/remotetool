@@ -26,7 +26,8 @@
      以 `"rtd/cb/v1"` 为域分隔前缀，对双方叶证书 DER 按字典序排序后拼接，
      再做 SHA-256（对称，与 TLS exporter 无关）。直连时两端一致；MITM 终结
      两条信道时对端证书不同 → 确认失败。这同时防住了 PAKE 的透明转发攻击；
-  4. 成功后双方落盘 `peers.json`（ID/名称/公钥/最近地址）。
+  4. 成功后双方落盘 `peers.json`（ID/名称/公钥/最近地址/平台/版本/能力
+     —— 双方在 pair.request/pair.confirm 里交换各自的设备元数据）。
 - 实现位置：`internal/identity/spake2.go`（M/N 常量 try-and-increment 派生，带
   错码/MITM/非法点单测）、`internal/daemon/pair.go`。
 
@@ -41,7 +42,8 @@
 ### 3.1 信道划分（借鉴 UU 的四通道模型，WebRTC DataChannel → QUIC 流）
 
 - **控制流**（每连接 1 条，拨号方打开）：u32 前缀 JSON 帧多路复用请求/响应/
-  通知（`internal/proto/rpc.go`）。方法：`hello`、`pair.*`、`fs.*`、`xfer.*`、
+  通知（`internal/proto/rpc.go`）。方法：`hello`（交换 ID/名称/平台/版本/能力，
+  后三个可选字段，老版本对端缺省为空）、`pair.*`、`fs.*`、`xfer.*`（含 `xfer.cancel`）、
   `term.open/resize/close/list`、`fwd.listen/unlisten/grant`。
 - **数据流**（按需多条）：首字节信道类型 + u32 前缀 JSON 头，其后为纯二进制：
   - `ChanTerm`：会话 id 定位，之后为 PTY 原始字节（输入输出同流）；
@@ -89,8 +91,8 @@ fs 浏览操作：`fs.list/mkdir/rename/remove/stat`（`fs.list` 空路径在 Wi
 
 ## 6. 发现与广域网
 
-- **局域网**：mDNS 广播/浏览 `_rtd._udp.local.`，TXT 带 `id`/`name`
-  （`internal/discover`）。
+- **局域网**：mDNS 广播/浏览 `_rtd._udp.local.`，TXT 带 `id`/`name`/`pf`(平台)
+  （`internal/discover`）；发现条目 60s 未再广播即过期（Known() 只保留活跃宣告）。
 - **自建 hub**（`cmd/hub` + `internal/hub` + `internal/session/hubclient.go`）：
   - 设备→hub：QUIC（ALPN `rtd-hub/1`），`reg {token, id}` 注册、
     `resolve` 地址解析、`relay` 中继请求；
@@ -108,7 +110,10 @@ fs 浏览操作：`fs.list/mkdir/rename/remove/stat`（`fs.list` 空路径在 Wi
 - Web UI（`internal/web/webdist`，go:embed）：原生 JS + xterm.js（vendor 化），
   深色主题。页面：设备（配对/连接/发现）、终端（多标签会话）、文件（双栏 +
   拖拽 + 传输进度）、转发、设置（设备名/hub）。鉴权：仅 127.0.0.1 + token
-  （header/query/cookie）。事件流 SSE（peer_up/down、传输进度）。
+  （header/query/cookie）。事件流 SSE（`peer_connecting`/`peer_up`（富
+  payload：name/platform/version/caps/addr/via）/`peer_down`、传输进度）。
+  设备状态由服务端聚合计算（`GET /api/peers` 与 `/api/status` 的 `peers`
+  均为 `device.Device` 视图），前端不自行 join；模型见 `docs/architecture.md` §2。
 - CLI `rt`：全部经 daemon 本地 HTTP API（不与守护进程抢连接；
   `term` 走 WebSocket 桥）。
 

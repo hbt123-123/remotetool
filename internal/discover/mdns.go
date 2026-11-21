@@ -15,11 +15,18 @@ import (
 // Service is the mDNS service type.
 const Service = "_rtd._udp"
 
+// entryTTL is how long a device stays in Known() after its last
+// advertisement. The browse loop runs every ~15s; two missed rounds mean
+// the device is gone (or its daemon stopped advertising).
+const entryTTL = 60 * time.Second
+
 // Entry is a discovered device.
 type Entry struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Addr string `json:"addr"`
+	ID       string    `json:"id"`
+	Name     string    `json:"name"`
+	Addr     string    `json:"addr"`
+	Platform string    `json:"platform,omitempty"`
+	Seen     time.Time `json:"seen"` // last advertisement, refreshed every browse round
 }
 
 // MDNS advertises this device and browses for others.
@@ -34,11 +41,12 @@ type MDNS struct {
 }
 
 // Start begins advertising and browsing. onEntry is called for every device
-// seen on the LAN (deduplicated per browse cycle).
-func Start(log *slog.Logger, id, name string, port int, onEntry func(Entry)) (*MDNS, error) {
+// seen on the LAN (deduplicated per browse cycle). Entries expire after
+// entryTTL without a fresh advertisement.
+func Start(log *slog.Logger, id, name, platform string, port int, onEntry func(Entry)) (*MDNS, error) {
 	m := &MDNS{log: log, id: id, known: map[string]Entry{}, stop: make(chan struct{})}
 	server, err := zeroconf.Register(name, Service, "local.", port,
-		[]string{"v=1", "id=" + id, "name=" + name}, activeInterfaces())
+		[]string{"v=1", "id=" + id, "name=" + name, "pf=" + platform}, activeInterfaces())
 	if err != nil {
 		return nil, err
 	}
@@ -110,6 +118,7 @@ func (m *MDNS) browseLoop(onEntry func(Entry)) {
 		}
 		cancel()
 		<-done
+		m.purgeExpired(time.Now())
 		select {
 		case <-m.stop:
 			return
@@ -118,13 +127,27 @@ func (m *MDNS) browseLoop(onEntry func(Entry)) {
 	}
 }
 
+// purgeExpired drops entries not advertised within entryTTL, so a device
+// that left the LAN (or shut its daemon down) disappears from Known().
+func (m *MDNS) purgeExpired(now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, e := range m.known {
+		if now.Sub(e.Seen) > entryTTL {
+			delete(m.known, id)
+		}
+	}
+}
+
 func (m *MDNS) handle(e *zeroconf.ServiceEntry, onEntry func(Entry)) {
-	var id, name string
+	var id, name, platform string
 	for _, t := range e.Text {
 		if strings.HasPrefix(t, "id=") {
 			id = strings.TrimPrefix(t, "id=")
 		} else if strings.HasPrefix(t, "name=") {
 			name = strings.TrimPrefix(t, "name=")
+		} else if strings.HasPrefix(t, "pf=") {
+			platform = strings.TrimPrefix(t, "pf=")
 		}
 	}
 	if id == "" || id == m.id {
@@ -145,7 +168,7 @@ func (m *MDNS) handle(e *zeroconf.ServiceEntry, onEntry func(Entry)) {
 	if addr == "" {
 		return
 	}
-	entry := Entry{ID: id, Name: name, Addr: addr}
+	entry := Entry{ID: id, Name: name, Addr: addr, Platform: platform, Seen: time.Now()}
 	m.mu.Lock()
 	m.known[id] = entry
 	m.mu.Unlock()

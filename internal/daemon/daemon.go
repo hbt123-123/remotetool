@@ -10,11 +10,13 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
 
 	"remotetool/internal/config"
+	"remotetool/internal/device"
 	"remotetool/internal/discover"
 	"remotetool/internal/filex"
 	"remotetool/internal/fwd"
@@ -32,6 +34,9 @@ type Options struct {
 	ListenPort int
 	WebPort    int
 	Verbose    bool
+	// Version is the daemon's own build version, reported to peers via the
+	// hello handshake and the pairing exchange.
+	Version string
 }
 
 // Daemon is the running rtd instance.
@@ -39,6 +44,7 @@ type Daemon struct {
 	store *config.Store
 	id    *identity.Identity
 	log   *slog.Logger
+	self  device.Meta // platform/version/caps reported in hello and pairing
 	mgr   *session.Manager
 	term  *term.Service
 	filex *filex.Service
@@ -88,13 +94,22 @@ func New(opts Options) (*Daemon, error) {
 	log.Info("device identity", "id", id.ID, "name", store.Get().Name)
 
 	hub := NewEventHub()
-	mgr := session.NewManager(id, store, log)
 
-	d := &Daemon{store: store, id: id, log: log, mgr: mgr, events: hub}
+	d := &Daemon{store: store, id: id, log: log, events: hub}
 	d.term = term.NewService(log)
 	d.filex = filex.NewService(log)
 	d.fwd = fwd.NewService(log, store)
-	d.pair = NewPairService(id, store, log)
+	// Self-reported metadata: platform from the running OS, version from the
+	// build (cmd/rtd's -ldflags stamp), caps from the registered features.
+	d.self = device.Meta{
+		Platform: runtime.GOOS,
+		Version:  opts.Version,
+		Caps:     []string{d.term.Name(), d.filex.Name(), d.fwd.Name()},
+	}
+
+	mgr := session.NewManager(id, store, log, d.self)
+	d.mgr = mgr
+	d.pair = NewPairService(id, store, log, d.self)
 
 	mgr.AddFeature(d.term)
 	mgr.AddFeature(d.filex)
@@ -151,7 +166,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.applyHub(ctx, cfg.HubAddr, cfg.HubToken)
 
 	// LAN discovery.
-	mdns, err := discover.Start(d.log, d.id.ID, cfg.Name, cfg.ListenPort, func(e discover.Entry) {
+	mdns, err := discover.Start(d.log, d.id.ID, cfg.Name, d.self.Platform, cfg.ListenPort, func(e discover.Entry) {
 		d.mgr.AddCandidate(e.ID, e.Addr)
 	})
 	if err != nil {
@@ -237,23 +252,26 @@ func (d *Daemon) Connect(ctx context.Context, peerID string) (*session.Peer, err
 }
 
 func (d *Daemon) resolvePeerArg(arg string) (*session.Peer, error) {
-	// Accept id, name prefix or exact name.
+	// Accept id, name prefix or exact name. Resolving implicitly dials, and
+	// some callers pass a deadline-less context, so bound the connect.
+	cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	peers := d.store.Peers()
 	var byName *config.Peer
 	for i := range peers {
 		if peers[i].ID == arg {
-			return d.mgr.Connect(context.Background(), peers[i].ID)
+			return d.mgr.Connect(cctx, peers[i].ID)
 		}
 		if peers[i].Name == arg {
 			byName = &peers[i]
 		}
 	}
 	if byName != nil {
-		return d.mgr.Connect(context.Background(), byName.ID)
+		return d.mgr.Connect(cctx, byName.ID)
 	}
 	for i := range peers {
 		if len(peers[i].ID) >= len(arg) && peers[i].ID[:len(arg)] == arg {
-			return d.mgr.Connect(context.Background(), peers[i].ID)
+			return d.mgr.Connect(cctx, peers[i].ID)
 		}
 	}
 	return nil, fmt.Errorf("no paired device matches %q", arg)
@@ -261,18 +279,89 @@ func (d *Daemon) resolvePeerArg(arg string) (*session.Peer, error) {
 
 // ConnectedView is the web's view of a live connection.
 type ConnectedView struct {
-	ID   string   `json:"id"`
-	Name string   `json:"name"`
-	Addr string   `json:"addr"`
-	Caps []string `json:"caps"`
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Addr     string   `json:"addr"`
+	Via      string   `json:"via,omitempty"` // "direct" | "relay"
+	Platform string   `json:"platform,omitempty"`
+	Version  string   `json:"version,omitempty"`
+	Caps     []string `json:"caps"`
 }
 
 func (d *Daemon) connectedViews() []ConnectedView {
 	out := []ConnectedView{}
 	for _, p := range d.mgr.Connected() {
-		out = append(out, ConnectedView{ID: p.ID, Name: p.Name, Addr: p.Addr, Caps: p.Caps})
+		out = append(out, ConnectedView{
+			ID:       p.ID,
+			Name:     p.Name,
+			Addr:     p.Addr,
+			Via:      string(p.Via),
+			Platform: p.Platform,
+			Version:  p.Version,
+			Caps:     p.Caps,
+		})
 	}
 	return out
+}
+
+// deviceViews renders every paired peer as a unified device.Device with the
+// aggregated lifecycle status (device.Aggregate) computed from the session
+// manager, mDNS and hub evidence.
+func (d *Daemon) deviceViews() []device.Device {
+	now := time.Now()
+	conns := make(map[string]*session.Peer)
+	for _, p := range d.mgr.Connected() {
+		conns[p.ID] = p
+	}
+	mdnsSeen := make(map[string]time.Time)
+	if d.mdns != nil {
+		for _, e := range d.mdns.Known() {
+			mdnsSeen[e.ID] = e.Seen
+		}
+	}
+	hubUp := d.hubOnline()
+
+	peers := d.store.Peers()
+	out := make([]device.Device, 0, len(peers))
+	for _, p := range peers {
+		ev := device.Evidence{
+			LastAddr:  p.LastAddr,
+			HubUsable: hubUp,
+			MDNSSeen:  mdnsSeen[p.ID],
+		}
+		// Runtime evidence (connected/connecting) comes straight from the
+		// manager; Aggregate classifies it with the persisted/discovery one.
+		switch d.mgr.StatusOf(p.ID) {
+		case device.StatusConnected:
+			ev.Connected = true
+		case device.StatusConnecting:
+			ev.Dialing = true
+		}
+		st := device.Aggregate(ev, now)
+		dv := device.Device{
+			ID:       p.ID,
+			Name:     p.Name,
+			Platform: p.Platform,
+			Version:  p.Version,
+			Caps:     p.Caps,
+			Status:   st,
+			LastSeen: p.LastSeen,
+			LastAddr: p.LastAddr,
+		}
+		if c := conns[p.ID]; c != nil {
+			dv.Conn = &device.ConnInfo{Kind: c.Via, Addr: c.Addr}
+		}
+		out = append(out, dv)
+	}
+	return out
+}
+
+// hubOnline reports whether the hub client link is currently up.
+func (d *Daemon) hubOnline() bool {
+	d.hubMu.Lock()
+	hc := d.hubClient
+	d.hubMu.Unlock()
+	return hc != nil && hc.Online()
 }
 
 func (d *Daemon) discovered() []discover.Entry {
@@ -300,10 +389,12 @@ func (d *Daemon) webAPI() *web.API {
 			return map[string]any{
 				"id":         d.id.ID,
 				"name":       cfg.Name,
+				"platform":   d.self.Platform,
+				"version":    d.self.Version,
 				"port":       cfg.ListenPort,
 				"web_port":   cfg.WebPort,
 				"connected":  d.connectedViews(),
-				"peers":      d.store.Peers(),
+				"peers":      d.deviceViews(),
 				"discovered": d.discovered(),
 				"invite":     inviteView(code, expires),
 				"hub_addr":   cfg.HubAddr,
@@ -323,7 +414,7 @@ func (d *Daemon) webAPI() *web.API {
 			d.applyHub(context.Background(), addr, token)
 			return nil
 		},
-		Peers: func() any { return d.store.Peers() },
+		Peers: func() any { return d.deviceViews() },
 		RemovePeer: func(id string) error {
 			d.mgr.Disconnect(id)
 			return d.store.RemovePeer(id)

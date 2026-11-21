@@ -175,16 +175,24 @@ func cmdStatus() error {
 	var st struct {
 		ID        string `json:"id"`
 		Name      string `json:"name"`
+		Platform  string `json:"platform"`
+		Version   string `json:"version"`
 		Port      int    `json:"port"`
 		WebPort   int    `json:"web_port"`
 		Connected []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-			Addr string `json:"addr"`
+			ID       string `json:"id"`
+			Name     string `json:"name"`
+			Addr     string `json:"addr"`
+			Via      string `json:"via"`
+			Platform string `json:"platform"`
+			Version  string `json:"version"`
 		} `json:"connected"`
 		Peers []struct {
 			ID       string `json:"id"`
 			Name     string `json:"name"`
+			Platform string `json:"platform"`
+			Version  string `json:"version"`
+			Status   string `json:"status"`
 			LastAddr string `json:"last_addr"`
 			LastSeen string `json:"last_seen"`
 		} `json:"peers"`
@@ -192,22 +200,53 @@ func cmdStatus() error {
 	if err := c.getJSON("/api/status", &st); err != nil {
 		return err
 	}
-	fmt.Printf("device: %s (%s)\n", st.Name, shortID(st.ID))
+	selfMeta := ""
+	if st.Platform != "" {
+		selfMeta += " · " + st.Platform
+	}
+	if st.Version != "" {
+		selfMeta += " v" + st.Version
+	}
+	fmt.Printf("device: %s (%s)%s\n", st.Name, shortID(st.ID), selfMeta)
 	fmt.Printf("listen: :%d   web: http://127.0.0.1:%d\n", st.Port, st.WebPort)
-	online := map[string]bool{}
+	printMeta := func(platform, version string) string {
+		s := ""
+		if platform != "" {
+			s += " · " + platform
+		}
+		if version != "" {
+			s += " v" + version
+		}
+		return s
+	}
+	connected := map[string]bool{}
 	for _, cn := range st.Connected {
-		online[cn.ID] = true
-		fmt.Printf("  [online] %s (%s) via %s\n", cn.Name, shortID(cn.ID), cn.Addr)
+		connected[cn.ID] = true
+		meta := printMeta(cn.Platform, cn.Version)
+		via := cn.Via
+		if via == "" {
+			via = "direct"
+		}
+		if via == "relay" {
+			// Relay sessions carry a marker, not a dialable address.
+			fmt.Printf("  [connected] %s (%s)%s via hub relay\n", cn.Name, shortID(cn.ID), meta)
+			continue
+		}
+		fmt.Printf("  [connected] %s (%s)%s via %s\n", cn.Name, shortID(cn.ID), meta, cn.Addr)
 	}
 	for _, p := range st.Peers {
-		if online[p.ID] {
+		if connected[p.ID] {
 			continue
 		}
 		last := p.LastSeen
 		if t, err := time.Parse(time.RFC3339, last); err == nil {
 			last = t.Local().Format("2006-01-02 15:04")
 		}
-		fmt.Printf("  [offline] %s (%s) last %s\n", p.Name, shortID(p.ID), last)
+		label := p.Status
+		if label == "" {
+			label = "offline"
+		}
+		fmt.Printf("  [%s] %s (%s)%s last %s\n", label, p.Name, shortID(p.ID), printMeta(p.Platform, p.Version), last)
 	}
 	if len(st.Peers) == 0 && len(st.Connected) == 0 {
 		fmt.Println("  no paired devices yet — run `rt pair` here, then `rt pair <addr> <code>` on the other device")

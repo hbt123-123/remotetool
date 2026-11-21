@@ -12,24 +12,34 @@ import (
 	"time"
 
 	"remotetool/internal/config"
+	"remotetool/internal/device"
 	"remotetool/internal/identity"
 	"remotetool/internal/proto"
 	"remotetool/internal/transport"
 )
 
-// hello is exchanged via the "hello" RPC method on connect.
+// hello is exchanged via the "hello" RPC method on connect. Platform and
+// Version are optional self-reported metadata; peers running older versions
+// omit them (JSON unknown/missing fields default to zero).
 type hello struct {
-	ID   string   `json:"id"`
-	Name string   `json:"name"`
-	Caps []string `json:"caps"`
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Platform string   `json:"platform,omitempty"`
+	Version  string   `json:"version,omitempty"`
+	Caps     []string `json:"caps"`
 }
 
 // Peer is one connected remote device.
 type Peer struct {
-	ID   string
-	Name string
-	Caps []string
-	Addr string
+	ID       string
+	Name     string
+	Platform string
+	Version  string
+	Caps     []string
+	Addr     string
+	// Via records how this session is routed: direct or through the hub
+	// relay. Derived from the address marker set by the dialer.
+	Via device.PathKind
 
 	// activeStreams counts this peer's concurrent data streams (bounded by
 	// maxPeerStreams) so one device cannot eat the whole connection quota.
@@ -84,7 +94,7 @@ type Feature interface {
 
 // Event describes a manager-level state change for the UI.
 type Event struct {
-	Type   string `json:"type"` // peer_up, peer_down
+	Type   string `json:"type"` // peer_connecting, peer_up, peer_down
 	PeerID string `json:"peer_id,omitempty"`
 	Data   any    `json:"data,omitempty"`
 }
@@ -94,6 +104,9 @@ type Manager struct {
 	id    *identity.Identity
 	store *config.Store
 	log   *slog.Logger
+	// self carries our platform/version (reported in hello). Name and Caps
+	// stay dynamic: the name lives in the store, caps follow features.
+	self device.Meta
 
 	mu       sync.Mutex
 	conns    map[string]*Peer
@@ -142,11 +155,12 @@ type dialCall struct {
 	err  error
 }
 
-func NewManager(id *identity.Identity, store *config.Store, log *slog.Logger) *Manager {
+func NewManager(id *identity.Identity, store *config.Store, log *slog.Logger, self device.Meta) *Manager {
 	return &Manager{
 		id:      id,
 		store:   store,
 		log:     log,
+		self:    self,
 		conns:   map[string]*Peer{},
 		cand:    map[string]map[string]bool{},
 		dialing: map[string]*dialCall{},
@@ -205,6 +219,23 @@ func (m *Manager) Get(peerID string) (*Peer, bool) {
 	return p, ok
 }
 
+// StatusOf reports the runtime part of the peer's lifecycle status:
+// connected or connecting. An empty result means the manager has no
+// evidence and the aggregation layer (daemon) must decide from persisted
+// and discovery evidence (see device.Aggregate). It is the single runtime
+// evidence entry point for the device views.
+func (m *Manager) StatusOf(peerID string) device.Status {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.conns[peerID]; ok {
+		return device.StatusConnected
+	}
+	if _, ok := m.dialing[peerID]; ok {
+		return device.StatusConnecting
+	}
+	return ""
+}
+
 // Connect ensures a peer is connected, single-flighting concurrent dials.
 func (m *Manager) Connect(ctx context.Context, peerID string) (*Peer, error) {
 	if p, ok := m.Get(peerID); ok {
@@ -226,6 +257,7 @@ func (m *Manager) Connect(ctx context.Context, peerID string) (*Peer, error) {
 	dc := &dialCall{done: make(chan struct{})}
 	m.dialing[peerID] = dc
 	m.mu.Unlock()
+	m.emit(Event{Type: "peer_connecting", PeerID: peerID})
 
 	p, err := m.dialPeer(ctx, peerID)
 	dc.peer, dc.err = p, err
@@ -286,7 +318,13 @@ func (m *Manager) ConnectAddr(ctx context.Context, addr string) (*Peer, error) {
 }
 
 func (m *Manager) myHello() hello {
-	return hello{ID: m.id.ID, Name: m.store.Get().Name, Caps: m.caps()}
+	return hello{
+		ID:       m.id.ID,
+		Name:     m.store.Get().Name,
+		Platform: m.self.Platform,
+		Version:  m.self.Version,
+		Caps:     m.caps(),
+	}
 }
 
 // maxPeerStreams caps one peer's concurrent data streams (ChanFile/ChanFwd/

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"remotetool/internal/config"
+	"remotetool/internal/device"
 	"remotetool/internal/identity"
 	"remotetool/internal/proto"
 	"remotetool/internal/transport"
@@ -27,7 +28,7 @@ func newTestManager(t *testing.T) (*Manager, *identity.Identity) {
 		t.Fatalf("store: %v", err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewManager(id, store, log), id
+	return NewManager(id, store, log, device.Meta{}), id
 }
 
 func setHelloTimeout(t *testing.T, d time.Duration) {

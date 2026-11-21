@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"remotetool/internal/config"
+	"remotetool/internal/device"
 	"remotetool/internal/identity"
 	"remotetool/internal/proto"
 	"remotetool/internal/transport"
@@ -99,6 +100,9 @@ type PairService struct {
 	id    *identity.Identity
 	store *config.Store
 	log   *slog.Logger
+	// self is reported to the peer in the pairing exchange (platform/version/
+	// caps); the name stays dynamic (read from the store at call time).
+	self device.Meta
 
 	mu     sync.Mutex
 	invite *invite
@@ -110,11 +114,12 @@ type PairService struct {
 	rate *tokenBucket  // bounds the unpaired connection admission rate
 }
 
-func NewPairService(id *identity.Identity, store *config.Store, log *slog.Logger) *PairService {
+func NewPairService(id *identity.Identity, store *config.Store, log *slog.Logger, self device.Meta) *PairService {
 	return &PairService{
 		id:    id,
 		store: store,
 		log:   log,
+		self:  self,
 		fails: map[string]*failState{},
 		sem:   make(chan struct{}, unpairedConns),
 		rate:  newTokenBucket(),
@@ -211,16 +216,20 @@ func (ps *PairService) recordWrongCodeLocked(key string, now time.Time) error {
 }
 
 type pairRequestParams struct {
-	Code  string   `json:"code"`
-	Name  string   `json:"name"`
-	Caps  []string `json:"caps,omitempty"`
-	Share []byte   `json:"share"`
+	Code     string   `json:"code"`
+	Name     string   `json:"name"`
+	Platform string   `json:"platform,omitempty"`
+	Version  string   `json:"version,omitempty"`
+	Caps     []string `json:"caps,omitempty"`
+	Share    []byte   `json:"share"`
 }
 type pairRequestResult struct {
-	Name    string   `json:"name"`
-	Caps    []string `json:"caps,omitempty"`
-	Share   []byte   `json:"share"`
-	Confirm []byte   `json:"confirm"`
+	Name     string   `json:"name"`
+	Platform string   `json:"platform,omitempty"`
+	Version  string   `json:"version,omitempty"`
+	Caps     []string `json:"caps,omitempty"`
+	Share    []byte   `json:"share"`
+	Confirm  []byte   `json:"confirm"`
 }
 type pairConfirmParams struct {
 	Confirm []byte `json:"confirm"`
@@ -271,9 +280,14 @@ func (ps *PairService) AttachPairHandlers(conn transport.Conn, rc *proto.RPCConn
 // attachTo registers pair.request/pair.confirm handlers with per-connection
 // SPAKE2 state.
 func (ps *PairService) attachTo(conn transport.Conn, rc *proto.RPCConn) {
+	// RPCConn dispatches each request on its own goroutine, so the
+	// request→confirm handoff goes through a per-connection mutex. A confirm
+	// arriving before its request completed sees the zero state and fails
+	// safely on the spk == nil check below.
+	var mu sync.Mutex
 	var spk *identity.SPAKE2
 	var pendingInv *invite // invite captured at pair.request time
-	var peerName string
+	var peerMeta device.Meta
 	rc.Handle("pair.request", func(params json.RawMessage) (any, error) {
 		var p pairRequestParams
 		if err := json.Unmarshal(params, &p); err != nil {
@@ -303,15 +317,30 @@ func (ps *PairService) attachTo(conn transport.Conn, rc *proto.RPCConn) {
 			ps.log.Warn("pairing failed", "peer", failKey(conn), "reason", err)
 			return nil, errPairingFailed
 		}
-		spk, pendingInv, peerName = s, inv, p.Name
-		return pairRequestResult{Name: ps.store.Get().Name, Share: y, Confirm: confirm}, nil
+		mu.Lock()
+		peerMeta = device.Meta{Name: p.Name, Platform: p.Platform, Version: p.Version, Caps: p.Caps}
+		spk, pendingInv = s, inv
+		mu.Unlock()
+		return pairRequestResult{
+			Name:     ps.store.Get().Name,
+			Platform: ps.self.Platform,
+			Version:  ps.self.Version,
+			Caps:     ps.self.Caps,
+			Share:    y,
+			Confirm:  confirm,
+		}, nil
 	})
 	rc.Handle("pair.confirm", func(params json.RawMessage) (any, error) {
-		if spk == nil {
-			return nil, errPairingFailed
-		}
 		var p pairConfirmParams
 		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, errPairingFailed
+		}
+		// Snapshot the request-handler state under the mutex: this handler may
+		// run on a different goroutine than pair.request did.
+		mu.Lock()
+		spk, pendingInv, peerMeta := spk, pendingInv, peerMeta
+		mu.Unlock()
+		if spk == nil {
 			return nil, errPairingFailed
 		}
 		// The invite may have been invalidated between pair.request and
@@ -327,18 +356,23 @@ func (ps *PairService) attachTo(conn transport.Conn, rc *proto.RPCConn) {
 			ps.log.Warn("pairing failed", "peer", failKey(conn), "reason", err)
 			return nil, errPairingFailed
 		}
-		// Mutual confirmation succeeded: pin the peer.
+		// Mutual confirmation succeeded: pin the peer together with its
+		// self-reported metadata (fixes the Caps dead field: the exchange
+		// always carried caps, but they were never persisted).
 		peerID := conn.RemoteID()
 		err := ps.store.UpsertPeer(config.Peer{
 			ID:       peerID,
-			Name:     peerName,
+			Name:     peerMeta.Name,
+			Platform: peerMeta.Platform,
+			Version:  peerMeta.Version,
+			Caps:     peerMeta.Caps,
 			PubKey:   conn.RemotePub(),
 			LastAddr: addrOf(conn),
 		})
 		if err != nil {
 			return nil, err
 		}
-		ps.log.Info("paired with device", "id", peerID, "name", peerName)
+		ps.log.Info("paired with device", "id", peerID, "name", peerMeta.Name)
 		ps.mu.Lock()
 		// Invalidate the invite (single use) and clear this caller's backoff.
 		if ps.invite == pendingInv {
@@ -392,7 +426,12 @@ func (ps *PairService) PairWith(ctx context.Context, addr, code string) (*config
 	}
 	var res pairRequestResult
 	if err := rc.Call(ctx, "pair.request", pairRequestParams{
-		Code: code, Name: ps.store.Get().Name, Share: x,
+		Code:     code,
+		Name:     ps.store.Get().Name,
+		Platform: ps.self.Platform,
+		Version:  ps.self.Version,
+		Caps:     ps.self.Caps,
+		Share:    x,
 	}, &res); err != nil {
 		return nil, err
 	}
@@ -410,7 +449,15 @@ func (ps *PairService) PairWith(ctx context.Context, addr, code string) (*config
 	if pub == nil {
 		return nil, errors.New("peer identity unavailable")
 	}
-	peer := &config.Peer{ID: peerID, Name: res.Name, PubKey: pub, LastAddr: addr}
+	peer := &config.Peer{
+		ID:       peerID,
+		Name:     res.Name,
+		Platform: res.Platform,
+		Version:  res.Version,
+		Caps:     res.Caps,
+		PubKey:   pub,
+		LastAddr: addr,
+	}
 	if err := ps.store.UpsertPeer(*peer); err != nil {
 		return nil, err
 	}

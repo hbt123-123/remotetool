@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"remotetool/internal/config"
+	"remotetool/internal/device"
 	"remotetool/internal/identity"
 )
 
@@ -22,7 +23,7 @@ func newTestPairService(t *testing.T) *PairService {
 		t.Fatalf("config: %v", err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewPairService(id, store, log)
+	return NewPairService(id, store, log, device.Meta{})
 }
 
 // otherCode returns a 6-digit code different from code.

@@ -16,6 +16,11 @@ func (s *Server) peerAPI(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/status" && r.Method == http.MethodGet:
 		writeJSON(w, s.api.Status())
 
+	case r.URL.Path == "/api/peers" && r.Method == http.MethodGet:
+		// Device list with the server-computed lifecycle status; the same
+		// device.Device views as status.peers, without the rest of the snapshot.
+		writeJSON(w, s.api.Peers())
+
 	case r.URL.Path == "/api/name" && r.Method == http.MethodPost:
 		body, err := readBody[struct {
 			Name string `json:"name"`

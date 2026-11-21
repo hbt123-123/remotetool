@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"sync"
 	"time"
+
+	"remotetool/internal/device"
 )
 
 const (
@@ -32,10 +34,15 @@ type FwdRule struct {
 }
 
 // Peer is a paired remote device. PubKey pins its Ed25519 identity.
+// Platform/Version/Caps are the peer's self-reported metadata (windows /
+// linux / android, remotetool version, feature names) gathered from the
+// pairing exchange and refreshed by every successful hello handshake.
 type Peer struct {
 	ID       string    `json:"id"` // hex device id
 	Name     string    `json:"name"`
 	PubKey   []byte    `json:"pubkey"`
+	Platform string    `json:"platform,omitempty"`
+	Version  string    `json:"version,omitempty"`
 	Caps     []string  `json:"caps,omitempty"`
 	AddedAt  time.Time `json:"added_at"`
 	LastAddr string    `json:"last_addr,omitempty"`
@@ -290,16 +297,34 @@ func (s *Store) RemovePeer(id string) error {
 	return s.savePeersLocked()
 }
 
-// TouchPeer records a successful connection.
-func (s *Store) TouchPeer(id, addr string) {
+// TouchPeer records a successful connection: it refreshes LastSeen, persists
+// a new dialable addr (empty keeps the previous one — relayed connections
+// carry a non-dialable marker address that must never replace the real
+// one) and merges the peer's self-reported meta so renames, platform/version
+// upgrades and capability changes follow the live hello.
+func (s *Store) TouchPeer(id, addr string, meta device.Meta) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p, ok := s.peers[id]
 	if !ok {
 		return
 	}
-	p.LastAddr = addr
+	if addr != "" {
+		p.LastAddr = addr
+	}
 	p.LastSeen = time.Now()
+	if meta.Name != "" {
+		p.Name = meta.Name
+	}
+	if meta.Platform != "" {
+		p.Platform = meta.Platform
+	}
+	if meta.Version != "" {
+		p.Version = meta.Version
+	}
+	if len(meta.Caps) > 0 {
+		p.Caps = append([]string(nil), meta.Caps...)
+	}
 	s.peers[id] = p
 	_ = s.savePeersLocked()
 }

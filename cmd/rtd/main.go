@@ -37,6 +37,7 @@ func main() {
 		ListenPort: *listenPort,
 		WebPort:    *webPort,
 		Verbose:    *verbose,
+		Version:    version,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "rtd:", err)

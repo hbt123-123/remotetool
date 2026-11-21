@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"remotetool/internal/device"
 	"remotetool/internal/proto"
 	"remotetool/internal/transport"
 )
@@ -96,11 +98,29 @@ func (m *Manager) acceptHandshake(conn transport.Conn, addr string) (*Peer, erro
 	return m.register(conn, rc, addr, their), nil
 }
 
+// relayAddrPrefix marks session addresses that came through the hub relay.
+// They are not dialable targets, so they must never be persisted as a
+// peer's LastAddr.
+const relayAddrPrefix = "relay"
+
+// isRelayAddr reports whether addr denotes a relayed (non-dialable) path:
+// the dialer passes "relay", the relay acceptor passes "relay:<src>".
+func isRelayAddr(addr string) bool {
+	return addr == relayAddrPrefix || strings.HasPrefix(addr, relayAddrPrefix+":")
+}
+
 // register wires a verified connection into the manager and starts its
 // data-stream dispatch loop.
 func (m *Manager) register(conn transport.Conn, rc *proto.RPCConn, addr string, their hello) *Peer {
 	peerID := conn.RemoteID()
-	p := &Peer{ID: peerID, Name: their.Name, Caps: their.Caps, Addr: addr, conn: conn, rpc: rc, mgr: m}
+	via := device.PathDirect
+	if isRelayAddr(addr) {
+		via = device.PathRelay
+	}
+	p := &Peer{
+		ID: peerID, Name: their.Name, Platform: their.Platform, Version: their.Version,
+		Caps: their.Caps, Addr: addr, Via: via, conn: conn, rpc: rc, mgr: m,
+	}
 
 	m.mu.Lock()
 	features := append([]Feature{}, m.features...)
@@ -119,7 +139,15 @@ func (m *Manager) register(conn transport.Conn, rc *proto.RPCConn, addr string, 
 	if pa != nil {
 		pa(conn, rc)
 	}
-	m.store.TouchPeer(peerID, addr)
+	// Touch the peer with the hello's self-reported metadata. Relay sessions
+	// have no dialable address: pass "" so the stored LastAddr survives.
+	touchAddr := addr
+	if via == device.PathRelay {
+		touchAddr = ""
+	}
+	m.store.TouchPeer(peerID, touchAddr, device.Meta{
+		Name: their.Name, Platform: their.Platform, Version: their.Version, Caps: their.Caps,
+	})
 
 	go func() {
 		<-rc.Done()
@@ -131,7 +159,14 @@ func (m *Manager) register(conn transport.Conn, rc *proto.RPCConn, addr string, 
 		m.emit(Event{Type: "peer_down", PeerID: peerID})
 	}()
 	go m.dispatchLoop(p)
-	m.emit(Event{Type: "peer_up", PeerID: peerID, Data: map[string]any{"name": p.Name}})
-	m.log.Info("peer connected", "id", peerID, "name", p.Name, "addr", addr)
+	m.emit(Event{Type: "peer_up", PeerID: peerID, Data: map[string]any{
+		"name":     p.Name,
+		"platform": p.Platform,
+		"version":  p.Version,
+		"caps":     p.Caps,
+		"addr":     addr,
+		"via":      string(via),
+	}})
+	m.log.Info("peer connected", "id", peerID, "name", p.Name, "addr", addr, "via", via)
 	return p
 }

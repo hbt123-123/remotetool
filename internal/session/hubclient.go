@@ -70,6 +70,15 @@ func NewHubClient(id *identity.Identity, mgr *Manager, addr, token, hubPubkey st
 // Addr returns the configured hub address.
 func (h *HubClient) Addr() string { return h.addr }
 
+// Online reports whether the hub control connection is currently up. It is
+// reachability evidence for the device aggregation (a live hub link means
+// peers may be relayable), not proof that any given peer is registered.
+func (h *HubClient) Online() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.online
+}
+
 // Ensure dials (or reuses) the hub connection and registers. Concurrent
 // callers for the same address single-flight onto one dial.
 func (h *HubClient) Ensure(ctx context.Context) error {
