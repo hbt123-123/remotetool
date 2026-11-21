@@ -163,6 +163,25 @@ type API struct {
 	// Activity returns recent daemon operations for the UI feed (bounded
 	// in-memory ring, oldest first).
 	Activity func(limit int) any
+
+	// PeerPolicy returns the per-device authorization policy for the detail
+	// page (feature gates, file roots, fwd dial allow-list).
+	PeerPolicy func(id string) (any, error)
+	// SetPeerPolicy updates it. Nil slices keep the documented defaults
+	// (all features on, home-dir file roots, loopback fwd targets).
+	SetPeerPolicy func(id string, p PeerPolicy) error
+}
+
+// PeerPolicy is the per-paired-device authorization policy as edited in the
+// UI. The nil-vs-empty distinction of config.Peer survives the JSON round
+// trip: a null slice means "default" (feature allowed / home directory /
+// loopback targets), an empty array means "deny all".
+type PeerPolicy struct {
+	FileRoots     []string `json:"file_roots"`
+	FwdAllowHosts []string `json:"fwd_allow_hosts"`
+	Term          *bool    `json:"term"`
+	Files         *bool    `json:"files"`
+	Fwd           *bool    `json:"fwd"`
 }
 
 // Server is the HTTP layer.
@@ -182,13 +201,20 @@ func NewServer(log *slog.Logger, token string, api *API, hub *EventHub) *Server 
 	return &Server{log: log, token: token, api: api, hub: hub}
 }
 
-// Run blocks serving until ctx is done.
-func (s *Server) Run(ctx context.Context, addr string) error {
+// routes wires the URL space; kept separate from Run so tests can exercise
+// the handlers without a listener.
+func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/", s.auth(s.apiHandler))
 	mux.Handle("/api/term/ws", s.authHandler(s.wsOrigin(websocket.Handler(s.termWS))))
 	mux.HandleFunc("/api/events", s.auth(s.events))
 	mux.HandleFunc("/", s.static)
+	return mux
+}
+
+// Run blocks serving until ctx is done.
+func (s *Server) Run(ctx context.Context, addr string) error {
+	mux := s.routes()
 
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -224,21 +250,58 @@ func (s *Server) Run(ctx context.Context, addr string) error {
 	}
 }
 
+// rtCookie builds the session cookie for an authenticated response. Max-Age
+// is bounded (30 days) so a cookie copied out of a browser cannot live
+// forever; Secure is deliberately omitted because the UI is served over
+// plain http on 127.0.0.1 (docs/design.md 安全清单).
+func (s *Server) rtCookie() *http.Cookie {
+	return &http.Cookie{
+		Name:     "rt_token",
+		Value:    s.token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   30 * 24 * 60 * 60,
+	}
+}
+
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tok := r.Header.Get("X-RT-Token")
+		viaCookie := false
 		if tok == "" {
 			tok = r.URL.Query().Get("t")
 		}
 		if tok == "" {
 			if c, err := r.Cookie("rt_token"); err == nil {
 				tok = c.Value
+				viaCookie = true
 			}
 		}
 		if tok != s.token {
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
+		// CSRF gate for cookie-authenticated writes: SameSite=Strict already
+		// blocks cross-site sends in modern browsers, but an explicit Origin
+		// check closes the gap for the ones that do not. Browsers attach an
+		// Origin header to every fetch; header/query clients (the repo's CLI
+		// and termprobe) cannot be cross-site-forced and skip this.
+		if viaCookie {
+			switch r.Method {
+			case http.MethodPost, http.MethodPut, http.MethodDelete:
+				if origin := r.Header.Get("Origin"); origin != "" && !s.sameOrigin(origin) {
+					http.Error(w, "cross-origin write refused", http.StatusForbidden)
+					return
+				}
+			}
+		}
+		// Refresh the session cookie on every authenticated response: the
+		// SSE stream authenticates via cookie alone (EventSource cannot set
+		// headers), so a browser that logged in through the token gate must
+		// get the cookie even though its requests carry X-RT-Token. CLI
+		// clients ignore cookies.
+		http.SetCookie(w, s.rtCookie())
 		next(w, r)
 	}
 }
@@ -296,13 +359,7 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
-		http.SetCookie(w, &http.Cookie{
-			Name:     "rt_token",
-			Value:    s.token,
-			Path:     "/",
-			HttpOnly: true,
-			SameSite: http.SameSiteStrictMode,
-		})
+		http.SetCookie(w, s.rtCookie())
 		// path.Clean keeps the redirect target local: a path like //host
 		// would otherwise be treated as protocol-relative by browsers.
 		http.Redirect(w, r, path.Clean("/"+r.URL.Path), http.StatusFound)

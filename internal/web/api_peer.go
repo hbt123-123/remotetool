@@ -127,6 +127,37 @@ func (s *Server) peerAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, map[string]bool{"ok": true})
 
+	case strings.HasSuffix(r.URL.Path, "/policy") && strings.HasPrefix(r.URL.Path, "/api/peers/"):
+		// Per-device authorization policy: feature gates, file roots and the
+		// fwd dial allow-list. GET reads, POST replaces.
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/peers/"), "/policy")
+		if id == "" || strings.Contains(id, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			v, err := s.api.PeerPolicy(id)
+			if err != nil {
+				errJSON(w, err)
+				return
+			}
+			writeJSON(w, v)
+		case http.MethodPost:
+			body, err := readBody[PeerPolicy](w, r)
+			if err != nil {
+				errJSON(w, err)
+				return
+			}
+			if err := s.api.SetPeerPolicy(id, *body); err != nil {
+				errJSON(w, err)
+				return
+			}
+			writeJSON(w, map[string]bool{"ok": true})
+		default:
+			http.NotFound(w, r)
+		}
+
 	default:
 		http.NotFound(w, r)
 	}

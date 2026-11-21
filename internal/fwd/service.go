@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -107,6 +108,45 @@ type listenParams struct {
 	Port int    `json:"port"`
 }
 
+// hostAllowed reports whether host matches one of the allowed dial targets.
+// Entries may be exact hosts, IPs or CIDR blocks ("192.168.1.0/24"); host
+// comparison is case-insensitive and IPs compare by value (so "::ffff:127.0.0.1"
+// matches an allow-listed 127.0.0.1).
+func hostAllowed(host string, allow []string) bool {
+	if host == "" {
+		return false
+	}
+	ip := net.ParseIP(host)
+	for _, a := range allow {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			continue
+		}
+		if strings.EqualFold(a, host) {
+			return true
+		}
+		if ip == nil {
+			continue
+		}
+		if aip := net.ParseIP(a); aip != nil && aip.Equal(ip) {
+			return true
+		}
+		if _, cidr, err := net.ParseCIDR(a); err == nil && cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// fwdPermitted reports whether peerID may set up forwards on this device
+// (config.Peer.AllowFwd). The grant side is the security boundary: the dial
+// target travels only inside fwd.grant, so this check gates every path that
+// would have this device dial on a peer's behalf.
+func (s *Service) fwdPermitted(peerID string) bool {
+	p, ok := s.store.Peer(peerID)
+	return ok && p.AllowFwd()
+}
+
 // AttachRPC registers fwd control methods.
 func (s *Service) AttachRPC(peer *session.Peer, rc *proto.RPCConn) {
 	// Generation counter per peer: grants (and their cleanup watchers) are
@@ -117,6 +157,9 @@ func (s *Service) AttachRPC(peer *session.Peer, rc *proto.RPCConn) {
 		var p listenParams
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
+		}
+		if !s.fwdPermitted(peer.ID) {
+			return nil, fmt.Errorf("no such rule")
 		}
 		if p.Port <= 0 || p.Port > 65535 {
 			return nil, fmt.Errorf("bad port %d", p.Port)
@@ -130,6 +173,9 @@ func (s *Service) AttachRPC(peer *session.Peer, rc *proto.RPCConn) {
 		var p listenParams
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
+		}
+		if !s.fwdPermitted(peer.ID) {
+			return nil, fmt.Errorf("no such rule")
 		}
 		// Only the connection that created a listener may tear it down;
 		// foreign or unknown ids are ignored (no existence leak).
@@ -146,6 +192,17 @@ func (s *Service) AttachRPC(peer *session.Peer, rc *proto.RPCConn) {
 		}
 		if p.TargetPort <= 0 || p.TargetPort > 65535 {
 			return nil, fmt.Errorf("bad port %d", p.TargetPort)
+		}
+		if !s.fwdPermitted(peer.ID) {
+			return nil, fmt.Errorf("no such rule")
+		}
+		// Target-side consent: this device only dials targets its operator
+		// whitelisted for THIS peer (default: loopback only). Without this a
+		// rule owner could turn this device into a proxy for any address it
+		// can reach — internal services, link-local metadata endpoints.
+		cfgPeer, _ := s.store.Peer(peer.ID)
+		if !hostAllowed(p.TargetHost, cfgPeer.EffectiveFwdAllowHosts()) {
+			return nil, fmt.Errorf("dial target %q not allowed (add it to this device's fwd_allow_hosts for %s)", p.TargetHost, peer.ID)
 		}
 		if err := s.addGrant(p.ID, peer.ID, p.TargetHost, p.TargetPort, gen); err != nil {
 			return nil, err

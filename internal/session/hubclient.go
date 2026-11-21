@@ -44,6 +44,9 @@ type HubClient struct {
 	ctl      *proto.RPCConn
 	online   bool
 	ensuring map[string]*hubEnsure
+
+	closed    chan struct{} // set by Close: stops the KeepAlive loop
+	closeOnce sync.Once
 }
 
 // hubEnsure single-flights concurrent Ensure calls (mirrors Manager.dialCall).
@@ -51,6 +54,13 @@ type hubEnsure struct {
 	done chan struct{}
 	err  error
 }
+
+// KeepAlive knobs: vars so tests can shorten them.
+var (
+	hubRefreshInterval = time.Minute
+	hubReconnectBase   = time.Second
+	hubReconnectMax    = 5 * time.Minute
+)
 
 func NewHubClient(id *identity.Identity, mgr *Manager, addr, token, hubPubkey string, log *slog.Logger) *HubClient {
 	if hubPubkey == "" {
@@ -64,6 +74,7 @@ func NewHubClient(id *identity.Identity, mgr *Manager, addr, token, hubPubkey st
 		hubPubkey: hubPubkey,
 		log:       log,
 		ensuring:  map[string]*hubEnsure{},
+		closed:    make(chan struct{}),
 	}
 }
 
@@ -263,14 +274,102 @@ func (h *HubClient) acceptRelay(inc hub.RelayIncoming) {
 	}
 }
 
-// Close shuts the hub connection down.
-func (h *HubClient) Close() {
+// dropConn closes and forgets the current hub connection, so the next Ensure
+// dials again. Idempotent; safe with nothing connected.
+func (h *HubClient) dropConn() {
 	h.mu.Lock()
-	c := h.conn
+	conn, ctl := h.conn, h.ctl
+	h.conn, h.ctl, h.online = nil, nil, false
 	h.mu.Unlock()
-	if c != nil {
-		_ = c.Close()
+	if ctl != nil {
+		_ = ctl.Close()
 	}
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+// KeepAlive keeps the hub link up until ctx is done, the client is closed or
+// a KeepAlive goroutine is already running. Two jobs the lazy Ensure alone
+// cannot do:
+//   - send a registration refresh every hubRefreshInterval (the hub drops
+//     registrations after its device TTL, so a quiet link would expire);
+//   - reconnect with exponential backoff after any drop — Ensure only
+//     revives the link when someone dials, which on a phone that switched
+//     networks could take a very long time.
+//
+// Spawn it as a goroutine (daemon.Run does at startup and on hub config
+// changes; closing the replaced client stops the old loop).
+func (h *HubClient) KeepAlive(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			h.log.Error("hub keepalive panic", "panic", r)
+		}
+	}()
+	backoff := hubReconnectBase
+	for {
+		err := h.Ensure(ctx)
+		if err == nil {
+			backoff = hubReconnectBase
+			err = h.refreshLoop(ctx)
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-h.closed:
+			return
+		default:
+		}
+		h.log.Warn("hub link down; reconnecting", "addr", h.addr, "err", err, "backoff", backoff)
+		select {
+		case <-ctx.Done():
+			return
+		case <-h.closed:
+			return
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > hubReconnectMax {
+			backoff = hubReconnectMax
+		}
+	}
+}
+
+// refreshLoop sends the registration refresh until the hub link drops or ctx
+// is done. A failed refresh is treated as a dead link: the connection is
+// dropped so the next Ensure dials fresh.
+func (h *HubClient) refreshLoop(ctx context.Context) error {
+	for {
+		h.mu.Lock()
+		ctl := h.ctl
+		h.mu.Unlock()
+		if ctl == nil {
+			return errors.New("hub connection lost")
+		}
+		rctx, cancel := context.WithTimeout(ctx, hubRefreshInterval)
+		err := ctl.Call(rctx, "refresh", nil, nil)
+		cancel()
+		if err != nil {
+			h.dropConn()
+			return fmt.Errorf("hub refresh: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ctl.Done():
+			return errors.New("hub connection lost")
+		case <-time.After(hubRefreshInterval):
+		}
+	}
+}
+
+// Close shuts the hub connection down and stops the KeepAlive loop.
+func (h *HubClient) Close() {
+	h.closeOnce.Do(func() { close(h.closed) })
+	h.dropConn()
 }
 
 // ---- muxConn: TLS + yamux as a transport.Conn ----

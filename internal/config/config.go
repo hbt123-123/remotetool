@@ -35,10 +35,25 @@ type FwdRule struct {
 	TargetPort int    `json:"target_port"`
 }
 
+// PeerPerm gates which features a paired device may invoke on THIS machine.
+// Every field is a pointer so an absent JSON key (nil) means "allowed": a
+// fresh pairing grants full access, and the operator narrows it per device
+// afterwards. Denied features answer RPCs with the feature's generic
+// "no such ..." wording, exactly like a missing resource (no existence leak).
+type PeerPerm struct {
+	Term  *bool `json:"term,omitempty"`
+	Files *bool `json:"files,omitempty"`
+	Fwd   *bool `json:"fwd,omitempty"`
+}
+
 // Peer is a paired remote device. PubKey pins its Ed25519 identity.
 // Platform/Version/Caps are the peer's self-reported metadata (windows /
 // linux / android, remotetool version, feature names) gathered from the
 // pairing exchange and refreshed by every successful hello handshake.
+//
+// The policy fields (Perm / FileRoots / FwdAllowHosts) are evaluated on THIS
+// device for connections FROM that peer; they never constrain what this
+// device may do on the peer.
 type Peer struct {
 	ID       string    `json:"id"` // hex device id
 	Name     string    `json:"name"`
@@ -49,6 +64,53 @@ type Peer struct {
 	AddedAt  time.Time `json:"added_at"`
 	LastAddr string    `json:"last_addr,omitempty"`
 	LastSeen time.Time `json:"last_seen,omitempty"`
+
+	// Perm restricts the features this peer may invoke here (nil pointers
+	// inside = allowed). The struct itself always serializes; omitempty has
+	// no effect on it and is omitted for clarity.
+	Perm PeerPerm `json:"perm"`
+	// FileRoots lists the directories this peer may access via the file
+	// feature. nil (key absent in peers.json) = the documented default (this
+	// user's home directory); a non-nil empty list = no file access at all.
+	// That distinction must survive the JSON round trip (null vs []), so the
+	// tag intentionally has no omitempty.
+	FileRoots []string `json:"file_roots"`
+	// FwdAllowHosts lists the dial targets this peer may authorize through
+	// fwd.grant (mode L target side). nil = loopback only; empty = none.
+	FwdAllowHosts []string `json:"fwd_allow_hosts"`
+}
+
+// AllowTerm reports whether the peer may open terminal sessions here.
+func (p Peer) AllowTerm() bool { return p.Perm.Term == nil || *p.Perm.Term }
+
+// AllowFiles reports whether the peer may use the file feature here.
+func (p Peer) AllowFiles() bool { return p.Perm.Files == nil || *p.Perm.Files }
+
+// AllowFwd reports whether the peer may set up port forwards here.
+func (p Peer) AllowFwd() bool { return p.Perm.Fwd == nil || *p.Perm.Fwd }
+
+// EffectiveFileRoots returns the directories the peer may access on this
+// machine. A nil FileRoots keeps the documented default (this user's home
+// directory); if the home directory cannot be determined the safe fallback
+// is "no access".
+func (p Peer) EffectiveFileRoots() []string {
+	if p.FileRoots != nil {
+		return p.FileRoots
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return []string{}
+	}
+	return []string{home}
+}
+
+// EffectiveFwdAllowHosts returns the dial targets the peer may authorize
+// through fwd.grant. A nil list keeps the loopback-only default.
+func (p Peer) EffectiveFwdAllowHosts() []string {
+	if p.FwdAllowHosts != nil {
+		return p.FwdAllowHosts
+	}
+	return []string{"127.0.0.1", "localhost", "::1"}
 }
 
 // Config is config.json.
@@ -296,6 +358,21 @@ func (s *Store) RemovePeer(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.peers, id)
+	return s.savePeersLocked()
+}
+
+// UpdatePeer applies fn to one stored peer and persists. The peer's identity
+// fields (ID/PubKey) are managed by pairing; fn is meant for the policy
+// fields (Perm / FileRoots / FwdAllowHosts).
+func (s *Store) UpdatePeer(id string, fn func(p *Peer)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.peers[id]
+	if !ok {
+		return fmt.Errorf("no such peer %q", id)
+	}
+	fn(&p)
+	s.peers[id] = p
 	return s.savePeersLocked()
 }
 

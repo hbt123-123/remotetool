@@ -170,6 +170,7 @@
         <button data-tab="term" class="active">终端</button>
         <button data-tab="files">文件</button>
         <button data-tab="fwd">转发</button>
+        <button data-tab="policy">权限</button>
       </div>
 
       <div id="dv-tab-term" class="dv-tab active">
@@ -225,6 +226,37 @@
           <button id="dv-fwd-add" class="btn primary">添加规则</button>
         </div>
         <div id="dv-fwd-list" class="peer-list"></div>
+      </div>
+
+      <div id="dv-tab-policy" class="dv-tab">
+        <div class="card">
+          <h3>功能权限</h3>
+          <p class="dim">限制该设备在本机上可执行的操作，关闭后其对应请求会被拒绝（不影响本机操作对方）。</p>
+          <div class="form-row policy-toggles">
+            <label><input type="checkbox" id="dv-perm-term"> 终端</label>
+            <label><input type="checkbox" id="dv-perm-files"> 文件</label>
+            <label><input type="checkbox" id="dv-perm-fwd"> 端口转发</label>
+          </div>
+        </div>
+        <div class="card">
+          <h3>文件授权目录</h3>
+          <p class="dim">该设备通过文件功能可访问的本机目录。默认授权你的主目录；自定义模式下每行一个目录，留空表示拒绝所有文件访问。</p>
+          <div class="form-row policy-mode">
+            <label><input type="radio" name="dv-roots-mode" value="default" checked> 默认（主目录）</label>
+            <label><input type="radio" name="dv-roots-mode" value="custom"> 自定义</label>
+          </div>
+          <div class="form-row"><textarea id="dv-roots" rows="3" class="mono" placeholder="C:\Users\me\Documents" spellcheck="false"></textarea></div>
+        </div>
+        <div class="card">
+          <h3>转发拨号白名单</h3>
+          <p class="dim">该设备经端口转发可要求本机拨号的目标主机。默认仅允许回环地址；支持主机名、IP 与 CIDR 段，每行一个，留空表示禁止一切转发拨号。</p>
+          <div class="form-row policy-mode">
+            <label><input type="radio" name="dv-hosts-mode" value="default" checked> 默认（仅回环）</label>
+            <label><input type="radio" name="dv-hosts-mode" value="custom"> 自定义</label>
+          </div>
+          <div class="form-row"><textarea id="dv-hosts" rows="3" class="mono" placeholder="127.0.0.1&#10;192.168.1.0/24" spellcheck="false"></textarea></div>
+        </div>
+        <button id="dv-policy-save" class="btn primary">保存权限</button>
       </div>
     </section>
 

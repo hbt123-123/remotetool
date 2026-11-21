@@ -39,6 +39,13 @@ const (
 	resolveBurst = 20
 )
 
+// deviceTTL bounds how long a registration stays answerable without a
+// `refresh`: a device that dies without closing its connection (network
+// loss, sudden power-off) disappears from resolve/relay within minutes
+// instead of lingering forever. Clients refresh well inside the TTL
+// (hubRefreshInterval). A var so tests can shorten it.
+var deviceTTL = 5 * time.Minute
+
 // ---- u32-length JSON framing shared by hub and client ----
 
 func WriteMsg(w io.Writer, v any) error {
@@ -111,6 +118,10 @@ type devConn struct {
 	conn transport.Conn
 	ctl  *proto.RPCConn
 	addr string
+
+	// lastSeen is the moment of the latest reg/refresh. Guarded by the
+	// server mutex (every read and write happens under s.mu).
+	lastSeen time.Time
 
 	// resolve token bucket (resolveRate/s refill, burst resolveBurst) so one
 	// device cannot hammer the hub's resolve endpoint.
@@ -220,7 +231,8 @@ func (s *Server) Run(ln transport.Listener) error {
 	}
 }
 
-// reapLoop drops expired early entries every earlyReapInterval.
+// reapLoop drops expired early entries and stale device registrations every
+// earlyReapInterval.
 func (s *Server) reapLoop(done <-chan struct{}) {
 	// Long-lived background goroutine: log and die instead of crashing the
 	// whole hub.
@@ -237,7 +249,35 @@ func (s *Server) reapLoop(done <-chan struct{}) {
 			return
 		case <-t.C:
 			s.reapEarly()
+			s.reapStaleDevices()
 		}
+	}
+}
+
+// fresh reports whether a registration is still answerable (refreshed inside
+// the device TTL).
+func fresh(d *devConn, now time.Time) bool {
+	return now.Sub(d.lastSeen) < deviceTTL
+}
+
+// reapStaleDevices unregisters devices whose registration expired and closes
+// their connections, so the per-connection goroutine ends too. Without this,
+// a device that died mid-session would stay resolvable until its connection
+// finally noticed the network loss (which may never happen).
+func (s *Server) reapStaleDevices() {
+	now := time.Now()
+	s.mu.Lock()
+	var stale []transport.Conn
+	for id, d := range s.devices {
+		if !fresh(d, now) {
+			stale = append(stale, d.conn)
+			delete(s.devices, id)
+		}
+	}
+	s.mu.Unlock()
+	for _, c := range stale {
+		s.Log.Info("device registration expired", "id", c.RemoteID())
+		_ = c.Close()
 	}
 }
 
@@ -308,7 +348,7 @@ func (s *Server) serveConn(conn transport.Conn) {
 		if p.ID != conn.RemoteID() {
 			return nil, fmt.Errorf("registered id does not match certificate")
 		}
-		dev = &devConn{conn: conn, ctl: rc, addr: conn.RemoteAddr().String()}
+		dev = &devConn{conn: conn, ctl: rc, addr: conn.RemoteAddr().String(), lastSeen: time.Now()}
 		s.mu.Lock()
 		// Re-registering a known id replaces its entry and never counts
 		// against the cap, so reconnects keep working at capacity.
@@ -320,6 +360,19 @@ func (s *Server) serveConn(conn transport.Conn) {
 		s.mu.Unlock()
 		s.Log.Info("device registered", "id", p.ID, "addr", dev.addr)
 		return RegResult{Addr: dev.addr}, nil
+	})
+	rc.Handle("refresh", func(_ json.RawMessage) (any, error) {
+		// Idempotent liveness ping: extends the registration TTL. The
+		// connection's certificate is the identity — nothing to unmarshal.
+		if dev == nil {
+			return nil, fmt.Errorf("register first")
+		}
+		s.mu.Lock()
+		if cur := s.devices[conn.RemoteID()]; cur == dev {
+			dev.lastSeen = time.Now()
+		}
+		s.mu.Unlock()
+		return nil, nil
 	})
 	rc.Handle("resolve", func(params json.RawMessage) (any, error) {
 		var p ResolveParams
@@ -334,8 +387,9 @@ func (s *Server) serveConn(conn transport.Conn) {
 		}
 		s.mu.Lock()
 		d := s.devices[p.ID]
+		live := d != nil && fresh(d, time.Now())
 		s.mu.Unlock()
-		if d == nil {
+		if !live {
 			return ResolveResult{Found: false}, nil
 		}
 		return ResolveResult{Found: true, Addr: d.addr}, nil
@@ -406,8 +460,11 @@ func (s *Server) startRelay(src *devConn, p RelayParams) error {
 	}
 	s.mu.Lock()
 	dst := s.devices[p.Dst]
+	live := dst != nil && fresh(dst, time.Now())
 	s.mu.Unlock()
-	if dst == nil {
+	if !live {
+		// Same wording for "not registered" and "stale": no distinction for
+		// callers to infer from.
 		return fmt.Errorf("destination %s not online", p.Dst)
 	}
 	if s.pendingCount.Add(1) > maxPendingRelays {

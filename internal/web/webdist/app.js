@@ -166,7 +166,11 @@ function boot() {
 
 function connectEvents() {
   if (es) es.close();
-  es = new EventSource("/api/events?t=" + encodeURIComponent(TOKEN));
+  // The SSE stream authenticates via the rt_token cookie (HttpOnly, seeded by
+  // the ?t= handoff and refreshed on every authenticated API response):
+  // EventSource cannot set custom headers, and a token in the URL would leak
+  // into proxy and server logs.
+  es = new EventSource("/api/events");
   es.onmessage = (m) => {
     let ev; try { ev = JSON.parse(m.data); } catch { return; }
     if (ev.type === "peer_up" || ev.type === "peer_down" || ev.type === "peer_connecting") {
@@ -469,12 +473,58 @@ function setDeviceTab(tab) {
   if (tab === "fwd") {
     if (state.fwd) renderFwdInto($("#dv-fwd-list")); else refreshFwd();
   }
+  if (tab === "policy") loadPolicy(state.device);
 }
 
 $("#dv-term-open").addEventListener("click", () => openTerm(state.device));
 $("#dv-fwd-add").addEventListener("click", () => {
   switchPage("fwd");
   $("#fwd-peer").value = state.device || "";
+});
+
+// -------------------------------------------------------------- policy ---
+// Per-device authorization (feature gates, file roots, fwd dial allow-list).
+// Slices use null = documented default / non-null = explicit list, matching
+// config.Peer; the feature checkboxes are always sent explicitly.
+
+async function loadPolicy(id) {
+  if (!id) return;
+  try {
+    const pol = await api("GET", `/api/peers/${encodeURIComponent(id)}/policy`);
+    $("#dv-perm-term").checked = pol.term !== false;
+    $("#dv-perm-files").checked = pol.files !== false;
+    $("#dv-perm-fwd").checked = pol.fwd !== false;
+    setListMode("dv-roots-mode", "dv-roots", pol.file_roots);
+    setListMode("dv-hosts-mode", "dv-hosts", pol.fwd_allow_hosts);
+  } catch (e) { toast(e.message, true); }
+}
+
+function setListMode(radioName, taId, val) {
+  const custom = val != null; // null = default (home dir / loopback)
+  $$(`input[name="${radioName}"]`).forEach((r) => { r.checked = custom ? r.value === "custom" : r.value === "default"; });
+  $("#" + taId).value = custom ? (val || []).join("\n") : "";
+}
+
+function listFromMode(radioName, taId) {
+  const checked = $$(`input[name="${radioName}"]`).find((r) => r.checked);
+  if (!checked || checked.value !== "custom") return null;
+  // A non-null empty list = deny all (the explicit "custom" choice).
+  return $("#" + taId).value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+}
+
+$("#dv-policy-save").addEventListener("click", async () => {
+  const id = state.device;
+  if (!id) return;
+  try {
+    await api("POST", `/api/peers/${encodeURIComponent(id)}/policy`, {
+      term: $("#dv-perm-term").checked,
+      files: $("#dv-perm-files").checked,
+      fwd: $("#dv-perm-fwd").checked,
+      file_roots: listFromMode("dv-roots-mode", "dv-roots"),
+      fwd_allow_hosts: listFromMode("dv-hosts-mode", "dv-hosts"),
+    });
+    toast("权限已保存");
+  } catch (e) { toast(e.message, true); }
 });
 
 // ---------------------------------------------------------------- term ---

@@ -60,6 +60,12 @@ type Progress struct {
 type Service struct {
 	log *slog.Logger
 
+	// peerAuth resolves a caller's authorization: the directories it may
+	// touch (nil = unrestricted, for an unwired service) and whether the
+	// file feature is open to it at all. RPC handlers consult it on every
+	// call, so policy edits apply to live connections.
+	peerAuth func(peerID string) (roots []string, allowed bool)
+
 	mu     sync.Mutex
 	recv   map[string]*recvState // xferID -> inbound transfer
 	onProg func(Progress)
@@ -68,6 +74,23 @@ type Service struct {
 // NewService builds the filex feature.
 func NewService(log *slog.Logger) *Service {
 	return &Service{log: log, recv: map[string]*recvState{}}
+}
+
+// SetPeerAuth wires the per-peer authorization lookup (backed by the config
+// store). The daemon injects it at startup; leaving it nil keeps the service
+// fully permissive (direct tests, embedded use) — the e2e suite covers the
+// wired, enforced behavior.
+func (s *Service) SetPeerAuth(fn func(peerID string) (roots []string, allowed bool)) {
+	s.peerAuth = fn
+}
+
+// authFor resolves the caller's authorization. peerID is the
+// certificate-pinned remote device id.
+func (s *Service) authFor(peerID string) ([]string, bool) {
+	if s.peerAuth == nil {
+		return nil, true
+	}
+	return s.peerAuth(peerID)
 }
 
 // OnProgress installs the progress sink.
@@ -146,44 +169,99 @@ type cancelParams struct {
 }
 
 // AttachRPC registers this feature's control methods on a peer connection.
+// Every handler resolves the caller-supplied path against the peer's
+// authorized roots before touching the disk (see roots.go); a peer with the
+// file feature disabled gets the generic "no such ..." wording.
 func (s *Service) AttachRPC(peer *session.Peer, rc *proto.RPCConn) {
+	peerID := ""
+	if peer != nil {
+		peerID = peer.ID
+	}
 	rc.Handle("fs.list", func(params json.RawMessage) (any, error) {
 		var p listParams
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
 		}
-		return s.listDir(p.Path)
+		roots, allowed := s.authFor(peerID)
+		if !allowed {
+			return nil, errors.New("no such path")
+		}
+		if p.Path == "" {
+			if roots == nil {
+				// Unwired service: keep the legacy root listing.
+				return s.listDir("")
+			}
+			return listRoots(roots), nil
+		}
+		final, err := resolveInRoots(p.Path, roots)
+		if err != nil {
+			return nil, err
+		}
+		return s.listDir(final)
 	})
 	rc.Handle("fs.mkdir", func(params json.RawMessage) (any, error) {
 		var p pathParams
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
 		}
-		if p.Path == "" {
-			return nil, errors.New("path required")
+		roots, allowed := s.authFor(peerID)
+		if !allowed {
+			return nil, errors.New("no such path")
 		}
-		return nil, os.MkdirAll(p.Path, 0o755)
+		final, err := resolveInRoots(p.Path, roots)
+		if err != nil {
+			return nil, err
+		}
+		return nil, os.MkdirAll(final, 0o755)
 	})
 	rc.Handle("fs.rename", func(params json.RawMessage) (any, error) {
 		var p renameParams
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
 		}
-		return nil, os.Rename(p.From, p.To)
+		roots, allowed := s.authFor(peerID)
+		if !allowed {
+			return nil, errors.New("no such path")
+		}
+		from, err := resolveInRoots(p.From, roots)
+		if err != nil {
+			return nil, err
+		}
+		to, err := resolveInRoots(p.To, roots)
+		if err != nil {
+			return nil, err
+		}
+		return nil, os.Rename(from, to)
 	})
 	rc.Handle("fs.remove", func(params json.RawMessage) (any, error) {
 		var p removeParams
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
 		}
-		return nil, removePath(p.Path, p.Recursive)
+		roots, allowed := s.authFor(peerID)
+		if !allowed {
+			return nil, errors.New("no such path")
+		}
+		final, err := resolveInRoots(p.Path, roots)
+		if err != nil {
+			return nil, err
+		}
+		return nil, removePath(final, p.Recursive)
 	})
 	rc.Handle("fs.stat", func(params json.RawMessage) (any, error) {
 		var p pathParams
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
 		}
-		fi, err := os.Stat(p.Path)
+		roots, allowed := s.authFor(peerID)
+		if !allowed {
+			return nil, errors.New("no such path")
+		}
+		final, err := resolveInRoots(p.Path, roots)
+		if err != nil {
+			return nil, err
+		}
+		fi, err := os.Stat(final)
 		if err != nil {
 			return nil, err
 		}
@@ -195,14 +273,30 @@ func (s *Service) AttachRPC(peer *session.Peer, rc *proto.RPCConn) {
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
 		}
-		return s.prepareRecv(p.ID, p.Path, p.Size, true, p.Conflict, peer.ID)
+		roots, allowed := s.authFor(peerID)
+		if !allowed {
+			return nil, fmt.Errorf("no such transfer %s", p.ID)
+		}
+		final, err := resolveInRoots(p.Path, roots)
+		if err != nil {
+			return nil, err
+		}
+		return s.prepareRecv(p.ID, final, p.Size, true, p.Conflict, peer.ID)
 	})
 	rc.Handle("xfer.pull", func(params json.RawMessage) (any, error) {
 		var p pullParams
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
 		}
-		fi, err := os.Stat(p.SrcPath)
+		roots, allowed := s.authFor(peerID)
+		if !allowed {
+			return nil, fmt.Errorf("no such transfer %s", p.ID)
+		}
+		src, err := resolveInRoots(p.SrcPath, roots)
+		if err != nil {
+			return nil, err
+		}
+		fi, err := os.Stat(src)
 		if err != nil {
 			return nil, err
 		}
@@ -212,7 +306,7 @@ func (s *Service) AttachRPC(peer *session.Peer, rc *proto.RPCConn) {
 		if p.Offset < 0 || p.Offset > fi.Size() {
 			p.Offset = 0
 		}
-		go s.sendStream(peer, p.ID, p.SrcPath, fi.Size(), p.Offset)
+		go s.sendStream(peer, p.ID, src, fi.Size(), p.Offset)
 		return pullResult{Size: fi.Size()}, nil
 	})
 	rc.Handle("xfer.complete", func(params json.RawMessage) (any, error) {

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -100,6 +101,20 @@ func New(opts Options) (*Daemon, error) {
 	d.term = term.NewService(log)
 	d.filex = filex.NewService(log)
 	d.fwd = fwd.NewService(log, store)
+	// Per-peer authorization (config.Peer Perm / FileRoots): every feature
+	// consults the store-backed lookup on each call, so policy edits apply
+	// to live connections. fwd reads the store directly.
+	d.term.SetPeerAuth(func(peerID string) bool {
+		p, ok := store.Peer(peerID)
+		return ok && p.AllowTerm()
+	})
+	d.filex.SetPeerAuth(func(peerID string) ([]string, bool) {
+		p, ok := store.Peer(peerID)
+		if !ok {
+			return nil, false
+		}
+		return p.EffectiveFileRoots(), p.AllowFiles()
+	})
 	// Self-reported metadata: platform from the running OS, version from the
 	// build (cmd/rtd's -ldflags stamp), caps from the registered features.
 	d.self = device.Meta{
@@ -191,7 +206,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		webErr <- ws.Run(ctx, net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.WebPort)))
 	}()
 
-	d.log.Info("web ui", "url", fmt.Sprintf("http://127.0.0.1:%d/?t=%s", cfg.WebPort, cfg.WebToken))
+	d.log.Info("web ui", "url", fmt.Sprintf("http://127.0.0.1:%d/", cfg.WebPort))
+	// The full token URL goes to the console only — never to rtd.log (the
+	// logger's file writer would otherwise persist a usable credential).
+	fmt.Fprintf(os.Stderr, "web ui: %s (token URL is console-only; `rt url` shows it again)\n",
+		fmt.Sprintf("http://127.0.0.1:%d/?t=%s", cfg.WebPort, cfg.WebToken))
 	select {
 	case <-ctx.Done():
 		d.log.Info("shutting down")
@@ -226,11 +245,11 @@ func (d *Daemon) applyHub(ctx context.Context, addr, token string) {
 	d.hubMu.Lock()
 	d.hubClient = hc
 	d.hubMu.Unlock()
-	go func() {
-		if err := hc.Ensure(ctx); err != nil {
-			d.log.Warn("hub connect failed", "addr", addr, "err", err)
-		}
-	}()
+	// KeepAlive owns the link lifecycle: periodic registration refresh (the
+	// hub expires registrations after its TTL) and automatic reconnect with
+	// backoff after any drop. Closing the replaced client (below on config
+	// changes) stops the old loop.
+	go hc.KeepAlive(ctx)
 }
 
 // applyRules starts all persisted fwd rules belonging to a connected peer.
@@ -416,6 +435,7 @@ func (d *Daemon) webAPI() *web.API {
 				"discovered": d.discovered(),
 				"invite":     inviteView(code, expires),
 				"hub_addr":   cfg.HubAddr,
+				"hub_up":     d.hubOnline(),
 			}
 		},
 		SetName: func(name string) error {
@@ -660,7 +680,56 @@ func (d *Daemon) webAPI() *web.API {
 		Activity: func(limit int) any {
 			return map[string]any{"items": d.acts.List(limit)}
 		},
+		PeerPolicy: func(id string) (any, error) {
+			p, ok := d.store.Peer(id)
+			if !ok {
+				return nil, fmt.Errorf("no such device %q", id)
+			}
+			return web.PeerPolicy{
+				FileRoots:     p.FileRoots,
+				FwdAllowHosts: p.FwdAllowHosts,
+				Term:          p.Perm.Term,
+				Files:         p.Perm.Files,
+				Fwd:           p.Perm.Fwd,
+			}, nil
+		},
+		SetPeerPolicy: func(id string, pol web.PeerPolicy) error {
+			if _, ok := d.store.Peer(id); !ok {
+				return fmt.Errorf("no such device %q", id)
+			}
+			// Drop empty entries and trim whitespace so a stray blank line in
+			// the UI textarea does not become a root that silently matches
+			// nothing; the effective defaults still apply to nil slices.
+			roots := trimList(pol.FileRoots)
+			hosts := trimList(pol.FwdAllowHosts)
+			if err := d.store.UpdatePeer(id, func(p *config.Peer) {
+				p.FileRoots = roots
+				p.FwdAllowHosts = hosts
+				p.Perm.Term = pol.Term
+				p.Perm.Files = pol.Files
+				p.Perm.Fwd = pol.Fwd
+			}); err != nil {
+				return err
+			}
+			d.recordActivity("policy", id, "更新设备权限策略")
+			return nil
+		},
 	}
+}
+
+// trimList strips whitespace and drops empty entries from a user-edited list.
+// It returns nil for a nil input so the "default" marker survives.
+func trimList(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func inviteView(code string, expires time.Time) any {

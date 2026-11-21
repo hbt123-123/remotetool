@@ -3,6 +3,7 @@ package term
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -36,6 +37,13 @@ var (
 // Service is the terminal server feature: it hosts PTY sessions.
 type Service struct {
 	log *slog.Logger
+
+	// peerAuth resolves whether a caller may use the terminal feature at all
+	// (config.Peer.AllowTerm). Consulted on every RPC and stream attach, so
+	// policy edits apply live. nil (unwired — direct tests, embedded use)
+	// stays permissive; the daemon wires the store-backed lookup and the e2e
+	// suite covers the wired, enforced behavior.
+	peerAuth func(peerID string) bool
 
 	mu       sync.Mutex
 	nextID   uint64
@@ -102,12 +110,29 @@ var startPTY = StartPTY
 func (s *Service) Name() string     { return "term" }
 func (s *Service) Chan() proto.Chan { return proto.ChanTerm }
 
+// SetPeerAuth wires the per-peer terminal permission (backed by the config
+// store). See the peerAuth field comment for the nil semantics.
+func (s *Service) SetPeerAuth(fn func(peerID string) bool) { s.peerAuth = fn }
+
 func (s *Service) AttachRPC(peer *session.Peer, rc *proto.RPCConn) {
 	owner := ""
 	if peer != nil {
 		owner = peer.ID
 	}
+	// allowedNow consults the permission on every call: the operator can
+	// revoke a device's terminal access while its connection is live. A
+	// denied peer gets the same wording as a missing session — it must not
+	// learn the feature is disabled rather than absent.
+	allowedNow := func() bool {
+		if s.peerAuth == nil {
+			return true
+		}
+		return s.peerAuth(owner)
+	}
 	rc.Handle("term.open", func(params json.RawMessage) (any, error) {
+		if !allowedNow() {
+			return nil, errors.New("no such session")
+		}
 		var p openParams
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
@@ -118,6 +143,9 @@ func (s *Service) AttachRPC(peer *session.Peer, rc *proto.RPCConn) {
 		var p sessionIDParams
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
+		}
+		if !allowedNow() {
+			return nil, fmt.Errorf("no such session %d", p.Session)
 		}
 		sess := s.getOwned(owner, p.Session)
 		if sess == nil {
@@ -130,9 +158,15 @@ func (s *Service) AttachRPC(peer *session.Peer, rc *proto.RPCConn) {
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
 		}
+		if !allowedNow() {
+			return nil, fmt.Errorf("no such session %d", p.Session)
+		}
 		return nil, s.closeOwned(owner, p.Session)
 	})
 	rc.Handle("term.list", func(params json.RawMessage) (any, error) {
+		if !allowedNow() {
+			return []SessionInfo{}, nil
+		}
 		return s.list(owner), nil
 	})
 }
@@ -405,9 +439,17 @@ func (s *Service) detach(sess *Session, st transport.Stream) {
 }
 
 // HandleStream attaches an inbound data stream to the requested session.
-// Streams from devices that do not own the session are closed without any
-// hint the session exists.
+// Streams from devices that do not own the session — or that have lost the
+// terminal permission — are closed without any hint the session exists.
 func (s *Service) HandleStream(peer *session.Peer, _ proto.Chan, h *proto.DataHeader, st transport.Stream) {
+	if peer == nil {
+		_ = st.Close()
+		return
+	}
+	if s.peerAuth != nil && !s.peerAuth(peer.ID) {
+		_ = st.Close()
+		return
+	}
 	sess := s.get(h.Session)
 	if sess == nil || sess.owner != peer.ID {
 		_ = st.Close()

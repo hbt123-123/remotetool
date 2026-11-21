@@ -62,6 +62,16 @@ input, select {
   border-radius: 8px; padding: 8px 10px; font-size: 13px; outline: none; flex: 1; min-width: 0;
 }
 input:focus, select:focus { border-color: var(--acc); }
+textarea {
+  background: var(--bg3); color: var(--text); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 10px; font-size: 12.5px; outline: none; flex: 1; min-width: 0;
+  resize: vertical; font-family: ui-monospace, Consolas, monospace;
+}
+textarea:focus { border-color: var(--acc); }
+.policy-toggles label, .policy-mode label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--text); cursor: pointer; }
+.policy-toggles { gap: 18px; }
+.policy-mode { gap: 16px; margin-bottom: 6px; }
+.policy-mode input, .policy-toggles input { flex: none; accent-color: var(--acc); }
 .btn {
   background: var(--bg3); color: var(--text); border: 1px solid var(--line);
   border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer; transition: .15s;

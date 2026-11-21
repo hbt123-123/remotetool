@@ -2,12 +2,19 @@ package session
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"remotetool/internal/identity"
+	"remotetool/internal/proto"
 	"remotetool/internal/transport"
 )
 
@@ -73,5 +80,55 @@ func TestCertBindingSymmetry(t *testing.T) {
 	}
 	if len(ab) != sha256.Size {
 		t.Errorf("CertBinding length = %d, want %d", len(ab), sha256.Size)
+	}
+}
+
+// TestRefreshLoopDetectsDrop: refreshLoop sends the refresh RPC until the hub
+// side closes the connection, then reports the loss and clears the client
+// state so the next Ensure dials fresh.
+func TestRefreshLoopDetectsDrop(t *testing.T) {
+	hubSide, devSide := net.Pipe()
+	defer devSide.Close()
+	src := proto.NewRPCConn(hubSide)
+	src.Handle("refresh", func(_ json.RawMessage) (any, error) { return nil, nil })
+	go src.Serve()
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := &HubClient{log: log, addr: "test-hub"}
+	ctl := proto.NewRPCConn(devSide)
+	go ctl.Serve() // the client-side read loop that delivers refresh responses
+	h.mu.Lock()
+	h.conn, h.ctl, h.online = nil, ctl, true
+	h.mu.Unlock()
+	t.Cleanup(func() { _ = h.Close() })
+
+	oldInterval := hubRefreshInterval
+	hubRefreshInterval = 20 * time.Millisecond
+	t.Cleanup(func() { hubRefreshInterval = oldInterval })
+
+	errCh := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { errCh <- h.refreshLoop(ctx) }()
+
+	// Give the loop time to complete at least one successful refresh.
+	time.Sleep(60 * time.Millisecond)
+	// Kill the hub side: either the in-flight refresh fails or ctl.Done()
+	// fires — either way the loop must end with an error and clear the state.
+	_ = src.Close()
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("refreshLoop returned nil after the drop")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("refreshLoop did not notice the connection drop")
+	}
+	// The drop must clear the connection state (Ensure will dial again).
+	h.mu.Lock()
+	_, online := h.ctl, h.online
+	h.mu.Unlock()
+	if online {
+		t.Fatal("client still marked online after the drop")
 	}
 }
