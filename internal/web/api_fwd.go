@@ -12,7 +12,9 @@ import (
 func (s *Server) fwdAPI(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/api/fwd" && r.Method == http.MethodGet:
-		writeJSON(w, map[string]any{"rules": s.api.FwdRules(), "active": s.api.FwdActive()})
+		// `active` is kept for the CLI's rt fwd list; `status` adds the
+		// owner-side runtime detail (start time / last error) for the UI.
+		writeJSON(w, map[string]any{"rules": s.api.FwdRules(), "active": s.api.FwdActive(), "status": s.api.FwdStatus()})
 
 	case r.URL.Path == "/api/fwd/add" && r.Method == http.MethodPost:
 		body, err := readBody[config.FwdRule](w, r)

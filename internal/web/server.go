@@ -146,6 +146,9 @@ type API struct {
 	FwdAdd    func(rule config.FwdRule) error
 	FwdRemove func(id string) error
 	FwdActive func() map[string]bool
+	// FwdStatus returns the owner-side runtime status per rule id (running /
+	// stopped / last apply error + start time) for the UI's rule table.
+	FwdStatus func() any
 
 	// TermDial opens (or attaches to) a remote terminal session and returns
 	// the byte pipe, the session id and a resize callback.

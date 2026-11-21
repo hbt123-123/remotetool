@@ -529,7 +529,7 @@ func (d *Daemon) webAPI() *web.API {
 			if err := d.store.AddFwdRule(rule); err != nil {
 				return err
 			}
-			d.recordActivity("fwd", rule.PeerID, fmt.Sprintf("添加转发规则 -%s %d→%s:%d", rule.Mode, rule.ListenPort, rule.TargetHost, rule.TargetPort))
+			d.recordActivity("fwd", rule.PeerID, "添加转发规则 "+fwdRuleLabel(rule))
 			if peer, ok := d.mgr.Get(rule.PeerID); ok {
 				if err := d.fwd.ApplyRule(rule, peer); err != nil {
 					return err
@@ -555,10 +555,11 @@ func (d *Daemon) webAPI() *web.API {
 				return err
 			}
 			d.fwd.StopRule(rule)
-			d.recordActivity("fwd", rule.PeerID, fmt.Sprintf("删除转发规则 -%s %d→%s:%d", rule.Mode, rule.ListenPort, rule.TargetHost, rule.TargetPort))
+			d.recordActivity("fwd", rule.PeerID, "删除转发规则 "+fwdRuleLabel(rule))
 			return nil
 		},
 		FwdActive: d.fwd.ActiveRules,
+		FwdStatus: func() any { return d.fwd.RuleStatuses() },
 		TermDial: func(peerArg string, cols, rows uint16, sessionID uint64) (io.ReadWriteCloser, uint64, func(uint16, uint16) error, error) {
 			peer, err := d.resolvePeerArg(peerArg)
 			if err != nil {
@@ -602,4 +603,13 @@ func inviteView(code string, expires time.Time) any {
 		return nil
 	}
 	return map[string]any{"code": code, "expires": expires.UnixMilli()}
+}
+
+// fwdRuleLabel names a rule for the activity feed: the user-provided name
+// when set, otherwise the spec.
+func fwdRuleLabel(r config.FwdRule) string {
+	if r.Name != "" {
+		return r.Name
+	}
+	return fmt.Sprintf("-%s %d→%s:%d", r.Mode, r.ListenPort, r.TargetHost, r.TargetPort)
 }

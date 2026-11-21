@@ -24,7 +24,9 @@ const (
 
 // FwdRule is one persisted port-forwarding rule.
 type FwdRule struct {
-	ID         string `json:"id"`
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"` // optional display name ("Web 服务")
+	// PeerID is the paired device the rule tunnels through.
 	PeerID     string `json:"peer_id"`
 	Mode       string `json:"mode"` // "L": listen here, dial target via peer; "R": peer listens, we dial target
 	ListenHost string `json:"listen_host,omitempty"`

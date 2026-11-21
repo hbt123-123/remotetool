@@ -36,7 +36,19 @@ type Service struct {
 	listeners  map[string]*ruleListener // ruleID -> active listener on THIS device
 	grants     map[string]*grantEntry   // ruleID -> dial consent granted by a rule owner (mode L)
 	peerGen    map[string]uint64        // peerID -> current connection generation
+	status     map[string]RuleState     // ruleID -> owner-side runtime status
 	lookupPeer LookupPeerFn
+}
+
+// RuleState is the owner-side runtime status of a forwarding rule: whether a
+// listener is running (local for mode L, remote for mode R), when it started
+// and the error of the last failed apply. PeerID identifies the owning
+// connection so a disconnect can mark rules inactive until the re-apply.
+type RuleState struct {
+	PeerID    string    `json:"-"`
+	Active    bool      `json:"active"`
+	StartedAt time.Time `json:"started_at,omitempty"`
+	Err       string    `json:"err,omitempty"`
 }
 
 type ruleListener struct {
@@ -71,7 +83,19 @@ const dialTimeout = 10 * time.Second
 
 // NewService builds the fwd feature.
 func NewService(log *slog.Logger, store *config.Store) *Service {
-	return &Service{log: log, store: store, listeners: map[string]*ruleListener{}, grants: map[string]*grantEntry{}, peerGen: map[string]uint64{}}
+	return &Service{log: log, store: store, listeners: map[string]*ruleListener{}, grants: map[string]*grantEntry{}, peerGen: map[string]uint64{}, status: map[string]RuleState{}}
+}
+
+// setRuleActive marks a rule running (err == nil, stamping StartedAt) or
+// failed to apply (err != nil, recording the reason).
+func (s *Service) setRuleActive(id, peerID string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err != nil {
+		s.status[id] = RuleState{PeerID: peerID, Err: err.Error()}
+		return
+	}
+	s.status[id] = RuleState{PeerID: peerID, Active: true, StartedAt: time.Now()}
 }
 
 func (s *Service) Name() string     { return "fwd" }
@@ -129,10 +153,20 @@ func (s *Service) AttachRPC(peer *session.Peer, rc *proto.RPCConn) {
 		return nil, nil
 	})
 	// Grants are consent tied to a live connection: drop this generation's
-	// grants when the peer disconnects (peer.ID is the pinned remote id).
+	// grants when the peer disconnects (peer.ID is the pinned remote id), and
+	// mark the owner-side rules inactive — until the peer_up re-apply they
+	// cannot forward, even if a stale mode L listener lingers.
 	go func(peerID string, gen uint64) {
 		<-rc.Done()
 		s.dropGrantsGen(peerID, gen)
+		s.mu.Lock()
+		for id, st := range s.status {
+			if st.PeerID == peerID && st.Active {
+				st.Active = false
+				s.status[id] = st
+			}
+		}
+		s.mu.Unlock()
 	}(peer.ID, gen)
 }
 
@@ -308,6 +342,8 @@ func (s *Service) listenRemote(peer *session.Peer, id, host string, port int) er
 }
 
 // ApplyRule starts a rule for a connected peer (mode L here, mode R remote).
+// Every path updates the owner-side status table: success stamps StartedAt,
+// failure records the reason for the UI.
 func (s *Service) ApplyRule(rule config.FwdRule, peer *session.Peer) error {
 	switch rule.Mode {
 	case "L":
@@ -316,6 +352,7 @@ func (s *Service) ApplyRule(rule config.FwdRule, peer *session.Peer) error {
 			host = "127.0.0.1"
 		}
 		if err := loopbackAllowed(host, s.store.Get().AllowNonLoopbackFwd); err != nil {
+			s.setRuleActive(rule.ID, rule.PeerID, err)
 			return err
 		}
 		// The target no longer travels on data-stream headers: register the
@@ -325,7 +362,9 @@ func (s *Service) ApplyRule(rule config.FwdRule, peer *session.Peer) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
 		if err := peer.RPC(ctx, "fwd.grant", grantParams{ID: rule.ID, TargetHost: rule.TargetHost, TargetPort: rule.TargetPort}, nil); err != nil {
-			return fmt.Errorf("grant target on peer: %w", err)
+			err = fmt.Errorf("grant target on peer: %w", err)
+			s.setRuleActive(rule.ID, rule.PeerID, err)
+			return err
 		}
 		s.mu.Lock()
 		var stale *ruleListener
@@ -338,7 +377,9 @@ func (s *Service) ApplyRule(rule config.FwdRule, peer *session.Peer) error {
 				s.mu.Unlock()
 				// A different device is squatting on this id; refuse without
 				// disturbing its listener.
-				return fmt.Errorf("listener id already in use")
+				err := fmt.Errorf("listener id already in use")
+				s.setRuleActive(rule.ID, rule.PeerID, err)
+				return err
 			}
 			// Replace a listener left over from a previous connection of the
 			// same device.
@@ -352,11 +393,14 @@ func (s *Service) ApplyRule(rule config.FwdRule, peer *session.Peer) error {
 		addr := net.JoinHostPort(host, strconv.Itoa(rule.ListenPort))
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
-			return fmt.Errorf("listen %s: %w", addr, err)
+			err = fmt.Errorf("listen %s: %w", addr, err)
+			s.setRuleActive(rule.ID, rule.PeerID, err)
+			return err
 		}
 		rl := &ruleListener{Rule: rule, ln: ln, peer: peer}
 		s.mu.Lock()
 		s.listeners[rule.ID] = rl
+		s.status[rule.ID] = RuleState{PeerID: rule.PeerID, Active: true, StartedAt: time.Now()}
 		s.mu.Unlock()
 		go s.acceptLoop(rl)
 		s.log.Info("local forward listening", "rule", rule.ID, "addr", addr, "target", rule.TargetHost, "port", rule.TargetPort)
@@ -368,13 +412,18 @@ func (s *Service) ApplyRule(rule config.FwdRule, peer *session.Peer) error {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
-		return peer.RPC(ctx, "fwd.listen", listenParams{ID: rule.ID, Host: host, Port: rule.ListenPort}, nil)
+		err := peer.RPC(ctx, "fwd.listen", listenParams{ID: rule.ID, Host: host, Port: rule.ListenPort}, nil)
+		s.setRuleActive(rule.ID, rule.PeerID, err)
+		return err
 	default:
-		return fmt.Errorf("unknown mode %q", rule.Mode)
+		err := fmt.Errorf("unknown mode %q", rule.Mode)
+		s.setRuleActive(rule.ID, rule.PeerID, err)
+		return err
 	}
 }
 
-// StopRule tears a rule down (local listener and/or remote listener).
+// StopRule tears a rule down (local listener and/or remote listener) and
+// clears its status entry.
 func (s *Service) StopRule(rule config.FwdRule) {
 	s.stopListener(rule.ID)
 	if rule.Mode == "R" {
@@ -384,6 +433,9 @@ func (s *Service) StopRule(rule config.FwdRule) {
 			_ = peer.RPC(ctx, "fwd.unlisten", listenParams{ID: rule.ID}, nil)
 		}
 	}
+	s.mu.Lock()
+	delete(s.status, rule.ID)
+	s.mu.Unlock()
 }
 
 // stopListenerFor stops the listener only if it was created by this peer's
@@ -432,13 +484,31 @@ func (s *Service) StopAll() {
 	}
 }
 
-// ListenerRules returns the ids of rules currently listening locally.
+// ListenerRules returns the ids of rules currently listening — locally
+// (mode L) or on the peer (mode R, from the status table). This is the
+// shape the CLI's `rt fwd` list has always consumed.
 func (s *Service) ActiveRules() map[string]bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := map[string]bool{}
 	for id := range s.listeners {
 		out[id] = true
+	}
+	for id, st := range s.status {
+		if st.Active {
+			out[id] = true
+		}
+	}
+	return out
+}
+
+// RuleStatuses returns a copy of the owner-side status table for the web API.
+func (s *Service) RuleStatuses() map[string]RuleState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]RuleState, len(s.status))
+	for id, st := range s.status {
+		out[id] = st
 	}
 	return out
 }

@@ -146,6 +146,11 @@ SSE 事件 `peer_connecting` / `peer_up`（富 payload：name/platform/version/c
 - **hubclient 无自动重连**：hub 链路断开后静默离线，下次 Resolve/Relay 惰性重拨。
 - **活动日志为内存实现**：`internal/daemon/activity.go` 的 200 条环形缓冲，重启即清空
   （定位是"最近操作"信息流而非审计；持久记录由 slog 落 rtd.log）。
+- **fwd 规则状态**：owner 侧内存状态表（`fwd.Service.status`）记录每条规则的
+  运行中/已停止、启动时间与最近一次 apply 失败原因；连接断开时该连接的规则标记为
+  已停止（`rc.Done` watcher），重连后 `peer_up` 自动重新 apply。`GET /api/fwd` 的
+  `active` 字段为 CLI 兼容保留，UI 消费 `status`。规则可选 `name` 仅为本机展示
+  字段，不上线缆。
 - **浏览器直传未实现**：文件页拖放只给出提示；真实上传需要浏览器 File → 本机 rtd
   的二进制通道（涉及新端点的安全评审），留待后续阶段。
 - **UDP 打洞**：v0.2 路线图（design.md §6）。

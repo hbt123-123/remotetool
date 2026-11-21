@@ -422,7 +422,8 @@ function renderDeviceHead() {
   }
   const st = p.status || "offline";
   const on = st === "connected";
-  head.innerHTML = `
+  const offlineHint = on ? "" : `<div class="warn-bar">设备当前未连接（${esc(statusLabel(st))}），终端、文件与端口转发操作不可用。${st === "reachable" ? "点击上方「连接」或等待设备上线。" : ""}</div>`;
+  head.innerHTML = `${offlineHint}
     <div class="card dh st-${st}">
       <button class="icon-btn dh-back" title="返回首页">←</button>
       <span class="dot"></span>
@@ -878,6 +879,16 @@ async function loadDirWork(work, side) {
     renderDir(work, side);
     return;
   }
+  if (side === "remote" && !peerOnline(peer)) {
+    // Fail with a clear reason instead of a bare RPC error: fs browsing
+    // needs a live session, which only "connected" devices have.
+    const p = (state.status?.peers || []).find((x) => x.id === peer);
+    st.pathEl.textContent = p ? `设备未连接（${statusLabel(p.status)}），连接后可浏览文件` : "设备不存在";
+    st.entries = [];
+    renderDir(work, side);
+    return;
+  }
+  st.listEl.innerHTML = `<div class="empty" style="padding:12px">加载中…</div>`;
   try {
     const res = await api("GET", `/api/fs/list?peer=${encodeURIComponent(peer)}&path=${encodeURIComponent(st.path)}`);
     st.path = res.path || "";
@@ -1019,7 +1030,9 @@ function onXferEvent(p) {
 function renderXfers() {
   const list = $("#xfer-list");
   list.innerHTML = "";
-  for (const [, p] of [...state.xfers.entries()].slice(-30)) {
+  const entries = [...state.xfers.entries()].slice(-30);
+  if (!entries.length) { list.innerHTML = `<div class="empty">暂无传输任务</div>`; }
+  for (const [, p] of entries) {
     const row = document.createElement("div");
     row.className = "xfer-row";
     const pct = p.size > 0 ? Math.min(100, Math.round((100 * p.done) / p.size)) : 0;
@@ -1076,25 +1089,43 @@ function renderFwdInto(listEl) {
   if (!data || !listEl) return;
   listEl.innerHTML = "";
   const rules = data.rules || [];
-  if (!rules.length) { listEl.innerHTML = `<div class="empty">暂无规则</div>`; return; }
+  if (!rules.length) { listEl.innerHTML = `<div class="empty">暂无规则。连接设备后用上方表单添加。</div>`; return; }
+  const tbl = document.createElement("table");
+  tbl.className = "fwd-table";
+  tbl.innerHTML = `
+    <thead><tr><th>名称</th><th>类型</th><th>本地地址</th><th>远程地址</th><th>状态</th><th>启动时间</th><th></th></tr></thead>
+    <tbody></tbody>`;
+  const tb = tbl.querySelector("tbody");
   for (const r of rules) {
-    const active = (data.active || {})[r.id];
-    const row = document.createElement("div");
-    row.className = "peer-row" + (active ? " st-connected" : "");
-    row.innerHTML = `
-      <span class="dot"></span>
-      <div class="p-name">-${r.mode}</div>
-      <div class="p-meta mono">${esc(peerName(r.peer_id))}: ${esc(r.listen_host || "127.0.0.1")}:${r.listen_port} → ${esc(r.target_host)}:${r.target_port}</div>
-      <div class="p-actions"><span class="dim" style="font-size:12px">${active ? "生效中" : "等待连接"}</span></div>`;
-    const act = row.querySelector(".p-actions");
-    const del = document.createElement("button");
-    del.className = "btn small danger"; del.textContent = "删除";
-    del.addEventListener("click", async () => {
+    const st = (data.status || {})[r.id] || {};
+    const active = !!st.active || !!(data.active || {})[r.id];
+    const peer = (state.status?.peers || []).find((p) => p.id === r.peer_id);
+    const rowCls = st.err ? "fw-error" : active ? "fw-active" : "fw-stopped";
+    const tr = document.createElement("tr");
+    tr.className = rowCls;
+    tr.innerHTML = `
+      <td class="fw-name">${esc(r.name || "（未命名）")}</td>
+      <td><span class="p-badge" title="${r.mode === "L" ? "本机监听，经远端访问目标" : "远端监听，转回本机目标"}">-${esc(r.mode)}</span></td>
+      <td class="mono">${esc(r.listen_host || "127.0.0.1")}:${r.listen_port}</td>
+      <td class="mono">${esc(r.target_host)}:${r.target_port}</td>
+      <td class="fw-state">${st.err ? "错误" : active ? "运行中" : "已停止"}</td>
+      <td class="mono dim">${active && st.started_at ? fmtTime(st.started_at) : "—"}</td>
+      <td class="fw-del"></td>`;
+    tr.title = esc(peer?.name || shortID(r.peer_id));
+    tr.querySelector(".fw-del").innerHTML = `<button class="btn small danger">删除</button>`;
+    tr.querySelector(".fw-del button").addEventListener("click", async () => {
       try { await api("POST", "/api/fwd/remove", { id: r.id }); refreshFwd(); } catch (e) { toast(e.message, true); }
     });
-    act.appendChild(del);
-    listEl.appendChild(row);
+    tb.appendChild(tr);
+    if (st.err) {
+      // Show the failure reason on a full-width row under the rule.
+      const er = document.createElement("tr");
+      er.className = "fw-err-row";
+      er.innerHTML = `<td colspan="7">启动失败: ${esc(st.err)}</td>`;
+      tb.appendChild(er);
+    }
   }
+  listEl.appendChild(tbl);
 }
 
 $("#fwd-mode").addEventListener("change", () => {
@@ -1107,6 +1138,7 @@ $("#fwd-mode").addEventListener("change", () => {
 $("#fwd-add").addEventListener("click", async () => {
   const body = {
     peer_id: $("#fwd-peer").value,
+    name: $("#fwd-name").value.trim(),
     mode: $("#fwd-mode").value,
     listen_host: "127.0.0.1",
     listen_port: parseInt($("#fwd-listen-port").value, 10),
