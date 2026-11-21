@@ -7,7 +7,7 @@
 ## 1. 获取程序
 
 从 [Releases](https://github.com/hbt123-123/remotetool/releases) 下载对应
-平台的 zip（如 `remotetool-0.1.0-windows-amd64.zip`），解压得到三个二进制：
+平台的 zip（如 `remotetool-v0.1.0-windows-amd64.zip`），解压得到三个二进制：
 
 | 程序 | 用途 |
 |---|---|
