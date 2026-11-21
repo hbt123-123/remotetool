@@ -1,7 +1,11 @@
 name: CI
 
+# Branch pushes and PRs only: tag pushes run the release workflow instead,
+# which already runs the full test gate before publishing.
 on:
   push:
+    branches:
+      - master
   pull_request:
 
 jobs:

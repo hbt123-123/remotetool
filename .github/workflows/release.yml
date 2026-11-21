@@ -1,0 +1,42 @@
+name: Release
+
+# Tag-triggered publish pipeline: full test gate -> cross-compile -> package
+# -> GitHub Release with versioned zips + SHA256SUMS. The plain CI workflow
+# filters tag pushes out, so exactly one pipeline runs per tag.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Same full gate as CI: nothing ships unless the whole suite passes.
+      - name: Test (full, with race)
+        run: go test -race -timeout 18m ./...
+
+      - name: Build and package
+        run: |
+          chmod +x build.sh
+          ./build.sh package
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "remotetool $GITHUB_REF_NAME" \
+            --generate-notes
+          gh release upload "$GITHUB_REF_NAME" \
+            dist/release/*.zip dist/release/SHA256SUMS
