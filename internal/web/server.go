@@ -150,6 +150,13 @@ type API struct {
 	// TermDial opens (or attaches to) a remote terminal session and returns
 	// the byte pipe, the session id and a resize callback.
 	TermDial func(peerArg string, cols, rows uint16, sessionID uint64) (io.ReadWriteCloser, uint64, func(uint16, uint16) error, error)
+	// TermClose terminates a remote terminal session opened by this device
+	// (the WS detach alone leaves the PTY running for later re-attach).
+	TermClose func(peerArg string, session uint64) error
+
+	// Activity returns recent daemon operations for the UI feed (bounded
+	// in-memory ring, oldest first).
+	Activity func(limit int) any
 }
 
 // Server is the HTTP layer.

@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -20,6 +21,15 @@ func (s *Server) peerAPI(w http.ResponseWriter, r *http.Request) {
 		// Device list with the server-computed lifecycle status; the same
 		// device.Device views as status.peers, without the rest of the snapshot.
 		writeJSON(w, s.api.Peers())
+
+	case r.URL.Path == "/api/activity" && r.Method == http.MethodGet:
+		// Bounded in-memory feed of recent operations (resets on restart).
+		// The daemon's List caps the limit to its ring size, so no cap here.
+		limit := 50
+		if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 {
+			limit = n
+		}
+		writeJSON(w, s.api.Activity(limit))
 
 	case r.URL.Path == "/api/name" && r.Method == http.MethodPost:
 		body, err := readBody[struct {

@@ -26,7 +26,7 @@
   <aside class="sidebar">
     <div class="brand"><div class="logo-badge sm">RT</div><div><b>RT 远程</b><span id="side-name">…</span></div></div>
     <nav>
-      <a data-page="devices" class="nav-item active"><span class="ic">◈</span>设备</a>
+      <a data-page="home" class="nav-item active"><span class="ic">◈</span>首页</a>
       <a data-page="term" class="nav-item"><span class="ic">▌</span>终端</a>
       <a data-page="files" class="nav-item"><span class="ic">▣</span>文件</a>
       <a data-page="fwd" class="nav-item"><span class="ic">⇄</span>转发</a>
@@ -38,9 +38,26 @@
   </aside>
 
   <main class="main">
-    <!-- ===================== devices ===================== -->
-    <section id="page-devices" class="page active">
-      <h2>设备</h2>
+    <!-- ===================== home：设备总览 ===================== -->
+    <section id="page-home" class="page active">
+      <h2>首页</h2>
+      <div class="stats">
+        <div class="stat"><b id="st-devices">0</b><span>设备</span></div>
+        <div class="stat"><b id="st-online">0</b><span>在线</span></div>
+        <div class="stat"><b id="st-sessions">0</b><span>活跃会话</span></div>
+        <div class="stat"><b id="st-xfers">0</b><span>传输中</span></div>
+      </div>
+
+      <div class="card">
+        <h3>设备</h3>
+        <div id="device-grid" class="device-grid"></div>
+      </div>
+
+      <div class="card">
+        <h3>最近操作</h3>
+        <div id="activity-list" class="activity-list"></div>
+      </div>
+
       <div class="grid2">
         <div class="card">
           <h3>允许配对</h3>
@@ -60,11 +77,6 @@
       </div>
 
       <div class="card">
-        <h3>已配对设备</h3>
-        <div id="peer-list" class="peer-list"></div>
-      </div>
-
-      <div class="card">
         <h3>局域网发现</h3>
         <div id="discover-list" class="peer-list"></div>
       </div>
@@ -76,6 +88,7 @@
         <h2>终端</h2>
         <select id="term-peer"></select>
         <button id="term-open" class="btn primary">新建会话</button>
+        <span class="term-tools" id="term-tools"></span>
       </div>
       <div id="term-tabs" class="term-tabs"></div>
       <div id="term-panes" class="term-panes">
@@ -90,8 +103,8 @@
         <select id="fs-peer"></select>
         <span id="fs-progress-summary" class="dim"></span>
       </div>
-      <div class="files-grid">
-        <div class="pane" id="pane-local">
+      <div class="files-wrap" id="files-root">
+        <div class="pane" data-side="local">
           <div class="pane-head"><b>本机</b>
             <span class="pane-actions">
               <button data-act="up" class="icon-btn" title="上级目录">↑</button>
@@ -99,10 +112,14 @@
               <button data-act="mkdir" class="icon-btn" title="新建文件夹">＋</button>
             </span>
           </div>
-          <div class="pane-path mono" id="path-local"></div>
-          <div class="pane-list" id="list-local"></div>
+          <div class="pane-path mono"></div>
+          <div class="pane-list"></div>
         </div>
-        <div class="pane" id="pane-remote">
+        <div class="files-mid">
+          <button class="btn mid-push" disabled title="把左侧选中的文件发送到远端">⇒ 发送</button>
+          <button class="btn mid-pull" disabled title="把右侧选中的文件下载到本机">⇐ 下载</button>
+        </div>
+        <div class="pane" data-side="remote">
           <div class="pane-head"><b>远端</b>
             <span class="pane-actions">
               <button data-act="up" class="icon-btn" title="上级目录">↑</button>
@@ -110,8 +127,8 @@
               <button data-act="mkdir" class="icon-btn" title="新建文件夹">＋</button>
             </span>
           </div>
-          <div class="pane-path mono" id="path-remote"></div>
-          <div class="pane-list" id="list-remote"></div>
+          <div class="pane-path mono"></div>
+          <div class="pane-list"></div>
         </div>
       </div>
       <div class="card transfers">
@@ -145,6 +162,71 @@
       </div>
     </section>
 
+    <!-- ===================== device 详情 ===================== -->
+    <section id="page-device" class="page">
+      <div id="device-head"></div>
+      <div class="device-tabs" id="device-tabs">
+        <button data-tab="term" class="active">终端</button>
+        <button data-tab="files">文件</button>
+        <button data-tab="fwd">转发</button>
+      </div>
+
+      <div id="dv-tab-term" class="dv-tab active">
+        <div class="term-head">
+          <span id="dv-term-info" class="dim"></span>
+          <button id="dv-term-open" class="btn primary">新建会话</button>
+          <span class="term-tools" id="dv-term-tools"></span>
+        </div>
+        <div id="dv-term-tabs" class="term-tabs"></div>
+        <div id="dv-term-panes" class="term-panes">
+          <div class="term-empty dim">该设备暂无终端会话。</div>
+        </div>
+      </div>
+
+      <div id="dv-tab-files" class="dv-tab">
+        <div class="term-head">
+          <span class="dim">文件操作面向该设备</span>
+          <span id="dv-xfer-summary" class="dim"></span>
+        </div>
+        <div class="files-wrap" id="dv-files-root">
+          <div class="pane" data-side="local">
+            <div class="pane-head"><b>本机</b>
+              <span class="pane-actions">
+                <button data-act="up" class="icon-btn" title="上级目录">↑</button>
+                <button data-act="refresh" class="icon-btn" title="刷新">⟳</button>
+                <button data-act="mkdir" class="icon-btn" title="新建文件夹">＋</button>
+              </span>
+            </div>
+            <div class="pane-path mono"></div>
+            <div class="pane-list"></div>
+          </div>
+          <div class="files-mid">
+            <button class="btn mid-push" disabled title="把左侧选中的文件发送到远端">⇒ 发送</button>
+            <button class="btn mid-pull" disabled title="把右侧选中的文件下载到本机">⇐ 下载</button>
+          </div>
+          <div class="pane" data-side="remote">
+            <div class="pane-head"><b>远端</b>
+              <span class="pane-actions">
+                <button data-act="up" class="icon-btn" title="上级目录">↑</button>
+                <button data-act="refresh" class="icon-btn" title="刷新">⟳</button>
+                <button data-act="mkdir" class="icon-btn" title="新建文件夹">＋</button>
+              </span>
+            </div>
+            <div class="pane-path mono"></div>
+            <div class="pane-list"></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="dv-tab-fwd" class="dv-tab">
+        <div class="term-head">
+          <span class="dim">该设备的端口转发规则</span>
+          <button id="dv-fwd-add" class="btn primary">添加规则</button>
+        </div>
+        <div id="dv-fwd-list" class="peer-list"></div>
+      </div>
+    </section>
+
     <!-- ===================== settings ===================== -->
     <section id="page-settings" class="page">
       <h2>设置</h2>
@@ -168,7 +250,7 @@
       </div>
       <div class="card">
         <h3>关于</h3>
-        <p class="dim">RT 远程 v0.1 · 端到端加密（TLS 1.3 + 证书钉扎）· 配对采用 SPAKE2 + 通道绑定 · 局域网 mDNS 直连 · 自建 hub 中继</p>
+        <p class="dim">RT 远程 v0.2 · 端到端加密（TLS 1.3 + 证书钉扎）· 配对采用 SPAKE2 + 通道绑定 · 局域网 mDNS 直连 · 自建 hub 中继</p>
       </div>
     </section>
   </main>

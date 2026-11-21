@@ -390,6 +390,16 @@ func ClientAttach(peer *session.Peer, sessionID uint64) (*ClientSession, error) 
 	return &ClientSession{Peer: peer, ID: sessionID, Stream: st}, nil
 }
 
+// ClientCloseByID terminates a remote session by id without attaching to it
+// (the web UI's "end session" action). Unlike ClientAttach+Close it opens no
+// data stream; a session the peer no longer tracks just fails the RPC with
+// its uniform "no such session" error.
+func ClientCloseByID(peer *session.Peer, sessionID uint64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return peer.RPC(ctx, "term.close", sessionIDParams{Session: sessionID}, nil)
+}
+
 // Resize resizes the remote pty.
 func (c *ClientSession) Resize(cols, rows uint16) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

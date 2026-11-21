@@ -38,17 +38,29 @@ function toast(msg, isErr) {
 }
 
 function fmtSize(n) {
-  if (n == null) return "";
+  if (n == null || isNaN(n)) return "";
   const k = 1024;
   if (n >= k ** 3) return (n / k ** 3).toFixed(1) + " GB";
   if (n >= k ** 2) return (n / k ** 2).toFixed(1) + " MB";
   if (n >= k) return (n / k).toFixed(1) + " KB";
-  return n + " B";
+  return Math.round(n) + " B";
 }
 function fmtTime(iso) {
   if (!iso) return "";
   const d = new Date(iso);
   return isNaN(d) ? "" : d.toLocaleString("zh-CN", { hour12: false });
+}
+function fmtAgo(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const s = (Date.now() - d.getTime()) / 1000;
+  if (s < 0) return "刚刚";
+  if (s < 60) return "刚刚";
+  if (s < 3600) return Math.floor(s / 60) + " 分钟前";
+  if (s < 86400) return Math.floor(s / 3600) + " 小时前";
+  if (s < 86400 * 30) return Math.floor(s / 86400) + " 天前";
+  return d.toLocaleDateString("zh-CN");
 }
 function shortID(id) { return id ? id.slice(0, 8) : ""; }
 function esc(s) { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; }
@@ -60,22 +72,52 @@ function platformBadge(platform, version) {
   const v = version ? " · v" + esc(version) : "";
   return ` <span class="p-badge">${esc(platform)}${v}</span>`;
 }
+const CAPS = { term: "⌨ 终端", file: "▣ 文件", fwd: "⇄ 转发" };
+function capIcons(caps) {
+  return (caps || []).map((c) => (CAPS[c] ? `<span class="cap-badge">${CAPS[c]}</span>` : "")).join("");
+}
+function viaBadge(conn) {
+  if (!conn) return "";
+  const relay = conn.kind === "relay";
+  return `<span class="v-badge ${relay ? "relay" : "direct"}">${relay ? "中继" : "直连"}</span>`;
+}
+function peerOnline(id) {
+  const p = (state.status?.peers || []).find((x) => x.id === id);
+  return !!p && (p.status === "connected" || p.status === "online");
+}
+function peerName(id) {
+  const p = (state.status?.peers || []).find((x) => x.id === id);
+  return p ? p.name : shortID(id);
+}
+function joinPath(base, name) {
+  const b = (base || "").replace(/[\\/]+$/, "");
+  return b ? b + "/" + name : name;
+}
+function parentPath(p) {
+  const norm = (p || "").replace(/[\\/]+$/, "");
+  const i = Math.max(norm.lastIndexOf("/"), norm.lastIndexOf("\\"));
+  return i > 0 ? norm.slice(0, i) : i === 0 ? norm.slice(0, 1) : "";
+}
 
 // ---------------------------------------------------------------- state ---
 
 const state = {
   status: null,          // /api/status payload
-  page: "devices",
-  fs: {
-    local: { path: "", entries: [] },
-    remote: { path: "", entries: [] },
-    selLocal: null, selRemote: null,
-  },
+  page: "home",
+  device: null,          // device shown on the detail page
+  deviceTab: "term",
+  fwd: null,             // /api/fwd payload cache
   xfers: new Map(),      // id -> progress
-  terms: [],             // {id, peer, session, term, ws, fit, tab, pane}
+  terms: [],             // {id, peer, session, state, term, ws, fit, pane, retries, ...}
   activeTerm: null,
   termSeq: 0,
+  activity: [],          // most recent last
 };
+
+// File workspaces: one per UI location (files page + device detail page).
+// Built in bindWorks() once the DOM is ready.
+state.fs = null;
+state.dvfs = null;
 
 // ----------------------------------------------------------------- gate ---
 
@@ -107,9 +149,18 @@ if (TOKEN) tryGate(); else tryGate(true);
 
 let es = null;
 function boot() {
+  bindWorks();
+  buildTermTools($("#term-tools"));
+  buildTermTools($("#dv-term-tools"));
+
+  // Restore the view from the URL hash (#/device/<id> survives a refresh).
+  const [pg, arg] = parseHash();
+  switchPage(pg || "home", pg === "device" ? arg : null);
+
   refreshStatus();
   connectEvents();
-  setInterval(() => { if (state.page === "devices") refreshStatus(); }, 8000);
+  loadActivity();
+  setInterval(() => { if (state.page === "home" || state.page === "device") refreshStatus(); }, 8000);
 }
 
 function connectEvents() {
@@ -119,9 +170,12 @@ function connectEvents() {
     let ev; try { ev = JSON.parse(m.data); } catch { return; }
     if (ev.type === "peer_up" || ev.type === "peer_down" || ev.type === "peer_connecting") {
       refreshStatus();
-      if (ev.type === "peer_down") dropTermForPeer(ev.peer_id);
     } else if (ev.type === "xfer") {
       onXferEvent(ev.data);
+    } else if (ev.type === "activity") {
+      state.activity.push(ev.data);
+      if (state.activity.length > 50) state.activity = state.activity.slice(-50);
+      renderActivity();
     }
   };
   es.onerror = () => { /* EventSource auto-reconnects */ };
@@ -131,10 +185,13 @@ async function refreshStatus() {
   try {
     state.status = await api("GET", "/api/status");
     renderSide();
-    renderDevices();
+    renderHome();
+    if (state.page === "device") renderDeviceHead();
     renderTermPeers();
     renderFsPeers();
     renderFwdPeers();
+    renderTermTabs();
+    wakeOfflineTerms();
   } catch (e) {
     if (e.message !== "unauthorized") toast(e.message, true);
   }
@@ -142,17 +199,47 @@ async function refreshStatus() {
 
 // ----------------------------------------------------------------- nav ---
 
-$$(".nav-item").forEach((el) => el.addEventListener("click", () => {
-  $$(".nav-item").forEach((x) => x.classList.remove("active"));
-  el.classList.add("active");
-  $$(".page").forEach((p) => p.classList.remove("active"));
-  $("#page-" + el.dataset.page).classList.add("active");
-  state.page = el.dataset.page;
-  if (state.page === "devices") refreshStatus();
-  if (state.page === "fwd") refreshFwd();
-  if (state.page === "files") { renderFsPeers(); loadDir("local"); loadDir("remote"); }
-  if (state.page === "term") $$(".term-pane.active").forEach((p) => p && fitTerm(p._ts));
-}));
+function parseHash() {
+  const h = location.hash.replace(/^#\/?/, "");
+  if (h.startsWith("device/")) return ["device", h.slice("device/".length)];
+  if (h === "devices") return ["home", null];
+  if (["home", "term", "files", "fwd", "settings"].includes(h)) return [h, null];
+  return [null, null];
+}
+
+// switchPage is the single navigation entry: nav clicks, programmatic jumps
+// and hash restoration all land here. The hash is written back so
+// #/device/<id> survives refresh; the hashchange listener ignores echoes of
+// the state we just applied.
+function switchPage(name, arg) {
+  if (name === "device") {
+    if (arg && arg !== state.device) {
+      state.device = arg;
+      // New device under inspection: reset its remote pane.
+      Object.assign(state.dvfs.remote, { path: "", entries: [], sel: null });
+      state.deviceTab = "term";
+    }
+    if (!state.device) name = "home";
+  }
+  state.page = name;
+  $$(".nav-item").forEach((x) => x.classList.toggle("active", x.dataset.page === name));
+  $$(".page").forEach((p) => p.classList.toggle("active", p.id === "page-" + name));
+  const wantHash = name === "device" ? "#/device/" + state.device : name === "home" ? "#/" : "#/" + name;
+  if (location.hash !== wantHash) location.hash = wantHash;
+
+  if (name === "home") refreshStatus();
+  if (name === "fwd") refreshFwd();
+  if (name === "files") { renderFsPeers(); loadDirWork(state.fs, "local"); loadDirWork(state.fs, "remote"); }
+  if (name === "term") { if (state.activeTerm) activateTerm(state.activeTerm); }
+  if (name === "device") { renderDeviceHead(); setDeviceTab(state.deviceTab); }
+}
+
+window.addEventListener("hashchange", () => {
+  const [pg, arg] = parseHash();
+  if (!pg) return;
+  if (pg === state.page && (pg !== "device" || arg === state.device)) return;
+  switchPage(pg, pg === "device" ? arg : null);
+});
 
 function renderSide() {
   const s = state.status; if (!s) return;
@@ -164,12 +251,29 @@ function renderSide() {
   if (document.activeElement !== $("#set-hub")) $("#set-hub").value = s.hub_addr || "";
 }
 
-// -------------------------------------------------------------- devices ---
+// ---------------------------------------------------------- home：总览 ---
 
-function renderDevices() {
+function renderHome() {
+  renderStats();
+  renderInvite();
+  renderDeviceGrid();
+  renderDiscover();
+  renderActivity();
+}
+
+function renderStats() {
+  const peers = state.status?.peers || [];
+  const online = peers.filter((p) => p.status === "connected" || p.status === "online").length;
+  const sessions = state.terms.filter((t) => t.state !== "dead").length;
+  const xf = [...state.xfers.values()].filter((x) => x.state === "running").length;
+  $("#st-devices").textContent = peers.length;
+  $("#st-online").textContent = online;
+  $("#st-sessions").textContent = sessions;
+  $("#st-xfers").textContent = xf;
+}
+
+function renderInvite() {
   const s = state.status; if (!s) return;
-
-  // invite
   const box = $("#invite-box");
   if (s.invite) {
     const left = Math.max(0, Math.round((s.invite.expires - Date.now()) / 1000));
@@ -181,30 +285,43 @@ function renderDevices() {
     box.innerHTML = `<button id="invite-btn" class="btn primary">生成配对码</button>`;
     $("#invite-btn").addEventListener("click", makeInvite);
   }
+}
 
-  // peers — status comes from the server (device.Aggregate), no client join
-  const list = $("#peer-list");
-  list.innerHTML = "";
-  const peers = s.peers || [];
-  if (!peers.length) list.innerHTML = `<div class="empty">还没有配对设备，用上面的配对码完成首次配对。</div>`;
+function renderDeviceGrid() {
+  const grid = $("#device-grid");
+  if (!state.status) { grid.innerHTML = `<div class="empty">加载中…</div>`; return; }
+  const peers = state.status.peers || [];
+  grid.innerHTML = "";
+  if (!peers.length) {
+    grid.innerHTML = `<div class="empty">还没有配对设备。用下方配对码完成首次配对。</div>`;
+    return;
+  }
   for (const p of peers) {
     const st = p.status || "offline";
+    const card = document.createElement("div");
+    card.className = "device-card st-" + st;
+    card.innerHTML = `
+      <div class="dc-top">
+        <span class="dot"></span>
+        <b class="dc-name">${esc(p.name)}</b>
+        ${platformBadge(p.platform, p.version)}
+        ${viaBadge(p.conn)}
+      </div>
+      <div class="dc-caps">${capIcons(p.caps)}</div>
+      <div class="dc-meta mono">${shortID(p.id)}${p.last_addr ? " · " + esc(p.last_addr) : ""}</div>
+      <div class="dc-meta dim">${p.last_seen ? "最近在线 " + fmtAgo(p.last_seen) : "从未连接"} · ${esc(statusLabel(st))}</div>
+      <div class="dc-actions"></div>`;
+    // Clicking the card opens the device detail page; buttons keep their own
+    // handlers.
+    card.addEventListener("click", (e) => { if (e.target.closest("button")) return; switchPage("device", p.id); });
+    const act = card.querySelector(".dc-actions");
     const on = st === "connected";
-    const row = document.createElement("div");
-    row.className = "peer-row st-" + st;
-    row.innerHTML = `
-      <span class="dot"></span>
-      <div class="p-name">${esc(p.name)}${platformBadge(p.platform, p.version)}</div>
-      <div class="p-meta mono">${shortID(p.id)}${p.last_addr ? " · " + esc(p.last_addr) : ""}${p.last_seen ? " · " + fmtTime(p.last_seen) : ""}${st !== "connected" && st !== "offline" ? " · " + esc(statusLabel(st)) : ""}</div>
-      <div class="p-actions"></div>`;
-    const act = row.querySelector(".p-actions");
     const btn = document.createElement("button");
     btn.className = "btn small" + (on ? "" : " primary");
     btn.textContent = on ? "断开" : "连接";
     btn.addEventListener("click", async () => {
       try {
         await api("POST", on ? "/api/peers/disconnect" : "/api/peers/connect", { id: p.id });
-        toast(on ? "已断开" : "已连接");
         refreshStatus();
       } catch (e) { toast(e.message, true); }
     });
@@ -217,24 +334,44 @@ function renderDevices() {
     const btnF = document.createElement("button");
     btnF.className = "btn small";
     btnF.textContent = "文件";
-    btnF.addEventListener("click", async () => { $("#fs-peer").value = p.id; switchPage("files"); });
+    btnF.addEventListener("click", () => { switchPage("device", p.id); setDeviceTab("files"); });
     act.appendChild(btnF);
-    const btnX = document.createElement("button");
-    btnX.className = "btn small danger";
-    btnX.textContent = "删除";
-    btnX.addEventListener("click", async () => {
-      if (!confirm(`删除配对 ${p.name} (${shortID(p.id)})？`)) return;
-      try { await api("POST", "/api/peers/remove", { id: p.id }); refreshStatus(); } catch (e) { toast(e.message, true); }
-    });
-    act.appendChild(btnX);
+    grid.appendChild(card);
+  }
+}
+
+function renderActivity() {
+  const list = $("#activity-list");
+  if (!list) return;
+  const items = state.activity.slice().reverse();
+  if (!items.length) { list.innerHTML = `<div class="empty">暂无记录</div>`; return; }
+  list.innerHTML = "";
+  for (const a of items) {
+    const row = document.createElement("div");
+    row.className = "act-row act-" + esc(a.kind || "peer");
+    row.innerHTML = `<span class="act-time mono">${fmtTime(a.time)}</span><span class="act-text">${esc(a.text)}</span>`;
     list.appendChild(row);
   }
+}
 
-  // discovered
+async function loadActivity() {
+  try {
+    const res = await api("GET", "/api/activity?limit=50");
+    state.activity = res.items || [];
+    renderActivity();
+  } catch { /* older backend without the endpoint: keep the empty state */ }
+}
+
+// LAN discovery rows: unpaired devices seen via mDNS; "填入配对" copies the
+// address into the pairing form.
+function renderDiscover() {
+  const s = state.status;
   const dl = $("#discover-list");
+  if (!s) return;
   dl.innerHTML = "";
   if (!(s.discovered || []).length) {
     dl.innerHTML = `<div class="empty">同一局域网内未发现其他设备（双方都需运行 rtd）。</div>`;
+    return;
   }
   for (const d of s.discovered || []) {
     const row = document.createElement("div");
@@ -247,7 +384,6 @@ function renderDevices() {
     row.querySelector("button").addEventListener("click", () => {
       $("#pair-addr").value = d.addr;
       $("#pair-code").focus();
-      switchPage("devices");
     });
     dl.appendChild(row);
   }
@@ -274,15 +410,166 @@ $("#pair-btn").addEventListener("click", async () => {
   } catch (e) { msg.textContent = ""; toast(e.message, true); }
 });
 
-function switchPage(name) {
-  $$(".nav-item").forEach((x) => x.classList.toggle("active", x.dataset.page === name));
-  $$(".page").forEach((p) => p.classList.toggle("active", p.id === "page-" + name));
-  state.page = name;
-  if (name === "fwd") refreshFwd();
-  if (name === "files") { loadDir("local"); loadDir("remote"); }
+// ----------------------------------------------------- device 详情页 ---
+
+function renderDeviceHead() {
+  const head = $("#device-head");
+  if (!state.status) { head.innerHTML = `<div class="card"><div class="empty">加载中…</div></div>`; return; }
+  const p = state.status.peers.find((x) => x.id === state.device);
+  if (!p) {
+    head.innerHTML = `<div class="card"><div class="empty">设备不存在或已删除。</div></div>`;
+    return;
+  }
+  const st = p.status || "offline";
+  const on = st === "connected";
+  head.innerHTML = `
+    <div class="card dh st-${st}">
+      <button class="icon-btn dh-back" title="返回首页">←</button>
+      <span class="dot"></span>
+      <b class="dh-name">${esc(p.name)}</b>
+      ${platformBadge(p.platform, p.version)}
+      ${viaBadge(p.conn)}
+      <span class="dh-caps">${capIcons(p.caps)}</span>
+      <span class="dh-meta dim mono">${shortID(p.id)}${p.last_addr ? " · " + esc(p.last_addr) : ""}</span>
+      <span class="dh-meta dim">最近在线 ${fmtAgo(p.last_seen) || "从未"} · ${esc(statusLabel(st))}</span>
+      <span class="dh-actions">
+        <button class="btn small ${on ? "" : "primary"}" data-act="conn">${on ? "断开" : "连接"}</button>
+        <button class="btn small danger" data-act="del">删除</button>
+      </span>
+    </div>`;
+  head.querySelector(".dh-back").addEventListener("click", () => switchPage("home"));
+  head.querySelector('[data-act="conn"]').addEventListener("click", async () => {
+    try {
+      await api("POST", on ? "/api/peers/disconnect" : "/api/peers/connect", { id: p.id });
+      refreshStatus();
+    } catch (e) { toast(e.message, true); }
+  });
+  head.querySelector('[data-act="del"]').addEventListener("click", async () => {
+    if (!confirm(`删除配对 ${p.name} (${shortID(p.id)})？`)) return;
+    try { await api("POST", "/api/peers/remove", { id: p.id }); switchPage("home"); refreshStatus(); } catch (e) { toast(e.message, true); }
+  });
 }
 
+$$("#device-tabs button").forEach((b) => b.addEventListener("click", () => setDeviceTab(b.dataset.tab)));
+
+function setDeviceTab(tab) {
+  state.deviceTab = tab;
+  $$("#device-tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+  $$(".dv-tab").forEach((el) => el.classList.toggle("active", el.id === "dv-tab-" + tab));
+  $("#dv-term-info").textContent = peerName(state.device) + " 的终端会话";
+  if (tab === "term") {
+    const mine = state.terms.filter((t) => t.peer === state.device && t.state !== "dead");
+    if (mine.length && !mine.includes(state.activeTerm)) activateTerm(mine[mine.length - 1]);
+    renderTermTabs();
+  }
+  if (tab === "files") { loadDirWork(state.dvfs, "local"); loadDirWork(state.dvfs, "remote"); }
+  if (tab === "fwd") {
+    if (state.fwd) renderFwdInto($("#dv-fwd-list")); else refreshFwd();
+  }
+}
+
+$("#dv-term-open").addEventListener("click", () => openTerm(state.device));
+$("#dv-fwd-add").addEventListener("click", () => {
+  switchPage("fwd");
+  $("#fwd-peer").value = state.device || "";
+});
+
 // ---------------------------------------------------------------- term ---
+// Sessions live in state.terms and are shared between the terminal page and
+// the device detail page: tabs re-render into both containers, and
+// activateTerm moves the pane DOM into whichever container is on screen.
+
+const TERM_THEMES = {
+  dark: { name: "暗色", theme: { background: "#0b0e14", foreground: "#dfe6f3", cursor: "#4f7cff", cursorAccent: "#0b0e14", selectionBackground: "rgba(79,124,255,.35)" } },
+  light: { name: "亮色", theme: { background: "#f5f6f8", foreground: "#24292f", cursor: "#3b63d8", cursorAccent: "#f5f6f8", selectionBackground: "rgba(59,99,216,.25)" } },
+  solar: { name: "Solarized", theme: { background: "#002b36", foreground: "#c8d5dd", cursor: "#93a1a1", cursorAccent: "#002b36", selectionBackground: "rgba(147,161,161,.3)" } },
+  mono: { name: "单色", theme: { background: "#000000", foreground: "#e0e0e0", cursor: "#ffffff", cursorAccent: "#000000", selectionBackground: "rgba(255,255,255,.3)" } },
+};
+
+let termPrefs = loadTermPrefs();
+function loadTermPrefs() {
+  try {
+    const p = JSON.parse(localStorage.getItem("rt_term_prefs") || "{}");
+    return {
+      fontSize: Math.min(24, Math.max(9, Number(p.fontSize) || 13.5)),
+      theme: TERM_THEMES[p.theme] ? p.theme : "dark",
+    };
+  } catch { return { fontSize: 13.5, theme: "dark" }; }
+}
+function saveTermPrefs() { localStorage.setItem("rt_term_prefs", JSON.stringify(termPrefs)); }
+
+// applyTermOpt works across xterm.js versions (setOption pre-v4, options
+// object afterwards).
+function applyTermOpt(term, key, val) {
+  try {
+    if (typeof term.setOption === "function") term.setOption(key, val);
+    else term.options[key] = val;
+  } catch { /* ignore */ }
+}
+
+function applyTermPrefs() {
+  const theme = TERM_THEMES[termPrefs.theme]?.theme;
+  for (const ts of state.terms) {
+    applyTermOpt(ts.term, "fontSize", termPrefs.fontSize);
+    if (theme) applyTermOpt(ts.term, "theme", theme);
+    try { ts.fit.fit(); } catch { /* pane may be hidden */ }
+  }
+  $$(".term-theme").forEach((s) => { s.value = termPrefs.theme; });
+}
+
+function buildTermTools(host) {
+  host.innerHTML = `
+    <button class="icon-btn" data-t="copy" title="复制选中内容 (Ctrl+Shift+C)">⧉</button>
+    <button class="icon-btn" data-t="paste" title="粘贴 (Ctrl+V)">📋</button>
+    <button class="icon-btn" data-t="clear" title="清屏 (Ctrl+L)">⌫</button>
+    <button class="icon-btn" data-t="font-" title="减小字号">A−</button>
+    <button class="icon-btn" data-t="font+" title="增大字号">A＋</button>
+    <select class="term-theme" title="终端主题">${Object.entries(TERM_THEMES).map(([k, v]) => `<option value="${k}">${v.name}</option>`).join("")}</select>`;
+  host.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => termTool(b.dataset.t)));
+  const sel = host.querySelector(".term-theme");
+  sel.value = termPrefs.theme;
+  sel.addEventListener("change", () => { termPrefs.theme = sel.value; saveTermPrefs(); applyTermPrefs(); });
+}
+
+function termTool(t) {
+  const ts = state.activeTerm;
+  if ((t === "copy" || t === "paste" || t === "clear") && !ts) { toast("没有活跃的终端会话", true); return; }
+  if (t === "copy") copySel(ts);
+  else if (t === "paste") pasteClip(ts);
+  else if (t === "clear") clearTerm(ts);
+  else if (t === "font-") { termPrefs.fontSize = Math.max(9, termPrefs.fontSize - 1); saveTermPrefs(); applyTermPrefs(); }
+  else if (t === "font+") { termPrefs.fontSize = Math.min(24, termPrefs.fontSize + 1); saveTermPrefs(); applyTermPrefs(); }
+}
+
+function copyTextFallback(text) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); toast("已复制"); } catch { toast("复制失败，请手动复制", true); }
+  ta.remove();
+}
+
+async function copySel(ts) {
+  if (!ts.term.hasSelection()) { toast("请先用鼠标选中要复制的文本", true); return; }
+  const text = ts.term.getSelection();
+  try { await navigator.clipboard.writeText(text); toast("已复制"); }
+  catch { copyTextFallback(text); }
+}
+
+async function pasteClip(ts) {
+  let text = "";
+  try { text = await navigator.clipboard.readText(); }
+  catch { text = prompt("浏览器拒绝了剪贴板读取，请手动粘贴内容：") || ""; }
+  if (text) ts.term.paste(text);
+}
+
+function clearTerm(ts) {
+  ts.term.clear();
+  // Ctrl+L so the remote shell redraws its prompt on a clean line.
+  if (ts.ws && ts.ws.readyState === 1) ts.ws.send("\x0c");
+}
 
 function renderTermPeers() {
   const sel = $("#term-peer");
@@ -293,19 +580,26 @@ function renderTermPeers() {
 
 $("#term-open").addEventListener("click", () => openTerm($("#term-peer").value));
 
-async function openTerm(peerID) {
+function termPanesHost() {
+  return state.page === "device" && state.deviceTab === "term" ? $("#dv-term-panes") : $("#term-panes");
+}
+
+function openTerm(peerID) {
   if (!peerID) { toast("请先选择设备", true); return; }
+  const p = (state.status?.peers || []).find((x) => x.id === peerID);
+  if (p && p.status === "offline") { toast("设备离线，请先连接", true); return; }
   const id = "t" + (++state.termSeq);
   const pane = document.createElement("div");
   pane.className = "term-pane";
   const host = document.createElement("div");
   pane.appendChild(host);
-  $("#term-panes").appendChild(pane);
+  termPanesHost().appendChild(pane);
+
   const term = new Terminal({
     fontFamily: 'Consolas, "Cascadia Mono", monospace',
-    fontSize: 13.5,
+    fontSize: termPrefs.fontSize,
     cursorBlink: true,
-    theme: { background: "#0b0e14", foreground: "#dfe6f3", cursor: "#4f7cff", selectionBackground: "rgba(79,124,255,.35)" },
+    theme: TERM_THEMES[termPrefs.theme].theme,
     scrollback: 5000,
   });
   const fit = new FitAddon.FitAddon();
@@ -314,117 +608,295 @@ async function openTerm(peerID) {
 
   const cols = fit.proposeDimensions()?.cols || 80;
   const rows = fit.proposeDimensions()?.rows || 24;
-  let ws;
-  try {
-    ws = new WebSocket(`ws://${location.host}/api/term/ws?peer=${encodeURIComponent(peerID)}&cols=${cols}&rows=${rows}&t=${encodeURIComponent(TOKEN)}`);
-  } catch (e) { toast(e.message, true); pane.remove(); return; }
-  ws.binaryType = "arraybuffer";
-  const ts = { id, peer: peerID, session: 0, term, ws, fit, tab: null, pane, name: peerName(peerID) };
+  const ts = { id, peer: peerID, session: 0, state: "attaching", term, ws: null, fit, pane, name: peerName(peerID), retries: 0, reconnectTm: 0, manualClose: false };
   pane._ts = ts;
   state.terms.push(ts);
 
-  ws.onopen = () => { term.focus(); try { fit.fit(); } catch {} };
-  ws.onmessage = (m) => {
-    if (typeof m.data === "string") {
-      // session id announcement (JSON)
-      try { const j = JSON.parse(m.data); if (j.session) ts.session = j.session; } catch {}
-      return;
-    }
-    term.write(new Uint8Array(m.data));
-  };
-  ws.onclose = () => {
-    term.write("\r\n\x1b[90m— 会话已断开 —\x1b[0m\r\n");
-    ts.dead = true;
-  };
-  term.onData((d) => { if (ws.readyState === 1) ws.send(new TextEncoder().encode(d)); });
-
-  addTermTab(ts);
+  dialTerm(ts, cols, rows);
+  renderTermTabs();
   activateTerm(ts);
 }
 
-function peerName(id) {
-  const p = (state.status?.peers || []).find((x) => x.id === id);
-  return p ? p.name : shortID(id);
+function dialTerm(ts, cols, rows) {
+  const url = `ws://${location.host}/api/term/ws?peer=${encodeURIComponent(ts.peer)}&cols=${cols}&rows=${rows}` +
+    (ts.session ? `&session=${ts.session}` : "") +
+    `&t=${encodeURIComponent(TOKEN)}`;
+  let ws;
+  try { ws = new WebSocket(url); } catch (e) { toast(e.message, true); markTermDead(ts, "无法连接"); return; }
+  ts.ws = ws;
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => {
+    if (ts.retries > 0) ts.term.write("\r\n\x1b[32m— 已重新连接 —\x1b[0m\r\n");
+    ts.retries = 0;
+    setTermState(ts, "online");
+    ts.term.focus();
+    try { ts.fit.fit(); } catch { /* not laid out yet */ }
+  };
+  ws.onmessage = (m) => {
+    if (typeof m.data === "string") {
+      // session id announcement (JSON)
+      try { const j = JSON.parse(m.data); if (j.session) ts.session = j.session; } catch { /* not json */ }
+      return;
+    }
+    ts.term.write(new Uint8Array(m.data));
+  };
+  ws.onclose = () => {
+    // detachTerm/endTermSession already disposed the UI side; nothing to do.
+    if (ts.manualClose || !state.terms.includes(ts)) return;
+    scheduleTermReconnect(ts);
+  };
+  // Report PTY resizes back: the server accepts {"cols":N,"rows":N} text
+  // frames, so window resizes and tab switches reach the remote shell.
+  ts.term.onResize(({ cols: c, rows: r }) => {
+    if (ts.ws && ts.ws.readyState === 1) ts.ws.send(JSON.stringify({ cols: c, rows: r }));
+  });
+  ts.term.onData((d) => { if (ts.ws && ts.ws.readyState === 1) ts.ws.send(d); });
+  ts.term.attachCustomKeyEventHandler((e) => {
+    if (e.type !== "keydown") return true;
+    const k = (e.key || "").toLowerCase();
+    if (e.ctrlKey && e.shiftKey && k === "c") { copySel(ts); return false; }
+    if (e.ctrlKey && !e.shiftKey && k === "insert") { copySel(ts); return false; }
+    // Ctrl+V and Ctrl+Shift+V both paste; Shift+Insert too.
+    if (e.ctrlKey && k === "v") { pasteClip(ts); return false; }
+    if (e.shiftKey && k === "insert") { pasteClip(ts); return false; }
+    return true;
+  });
 }
 
-function addTermTab(ts) {
-  const tab = document.createElement("div");
-  tab.className = "term-tab";
-  tab.innerHTML = `<span>${esc(ts.name)}</span><span class="x">✕</span>`;
-  tab.addEventListener("click", (e) => {
-    if (e.target.classList.contains("x")) return;
-    activateTerm(ts);
-  });
-  tab.querySelector(".x").addEventListener("click", () => closeTerm(ts));
-  ts.tab = tab;
-  $("#term-tabs").appendChild(tab);
+function setTermState(ts, st) {
+  ts.state = st;
+  renderTermTabs();
+  renderStats();
+}
+
+function scheduleTermReconnect(ts) {
+  clearTimeout(ts.reconnectTm);
+  setTermState(ts, "reconnecting");
+  ts.term.write("\r\n\x1b[90m— 连接断开，正在重连… —\x1b[0m\r\n");
+  const delay = [3000, 5000, 10000][Math.min(ts.retries, 2)];
+  ts.retries += 1;
+  ts.reconnectTm = setTimeout(() => reconnectTerm(ts), delay);
+}
+
+function reconnectTerm(ts) {
+  if (ts.manualClose || ts.state === "dead") return;
+  if (!peerOnline(ts.peer) || ts.retries > 3) {
+    // Stop dialing until the device shows up again (wakeOfflineTerms on
+    // refreshStatus, or a click on the tab).
+    if (ts.ws && ts.ws.readyState === 1) return;
+    setTermState(ts, "offline");
+    return;
+  }
+  const dims = ts.fit.proposeDimensions() || { cols: 80, rows: 24 };
+  dialTerm(ts, dims.cols, dims.rows);
+}
+
+// wakeOfflineTerms resumes sessions whose device came back online.
+function wakeOfflineTerms() {
+  for (const ts of state.terms) {
+    if (ts.state === "offline" && peerOnline(ts.peer)) {
+      ts.retries = 0;
+      reconnectTerm(ts);
+    }
+  }
+}
+
+function markTermDead(ts, why) {
+  clearTimeout(ts.reconnectTm);
+  ts.state = "dead";
+  ts.term.write(`\r\n\x1b[90m— 会话已结束${why ? "（" + why + "）" : ""} —\x1b[0m\r\n`);
+  renderTermTabs();
+  renderStats();
+}
+
+function renderTermTabs() {
+  renderTabsInto($("#term-tabs"), state.terms);
+  renderTabsInto($("#dv-term-tabs"), state.terms.filter((t) => t.peer === state.device));
+}
+
+function renderTabsInto(hostEl, list) {
+  if (!hostEl) return;
+  hostEl.innerHTML = "";
+  for (const ts of list) {
+    const tab = document.createElement("div");
+    const badge = { online: "在线", reconnecting: "重连中", offline: "设备离线", dead: "已结束", attaching: "连接中" }[ts.state] || "";
+    tab.className = "term-tab ts-" + ts.state + (state.activeTerm === ts ? " active" : "");
+    tab.innerHTML = `<span class="t-dot"></span><span class="t-name">${esc(ts.name)}${ts.session ? " #" + ts.session : ""}</span>` +
+      (badge ? `<span class="t-st">${badge}</span>` : "") +
+      `<span class="x">✕</span>`;
+    tab.addEventListener("click", (e) => {
+      if (e.target.classList.contains("x")) return; // handled by the ✕ binding
+      activateTerm(ts);
+      if (ts.state === "offline" && peerOnline(ts.peer)) { ts.retries = 0; reconnectTerm(ts); }
+    });
+    tab.querySelector(".x").addEventListener("click", (e) => { e.stopPropagation(); closeTerm(ts); });
+    hostEl.appendChild(tab);
+  }
 }
 
 function activateTerm(ts) {
-  if (ts.dead) return;
-  state.terms.forEach((x) => { x.pane.classList.remove("active"); x.tab.classList.remove("active"); });
+  // Move the pane into whichever container is currently on screen.
+  const host = termPanesHost();
+  if (ts.pane.parentNode !== host) host.appendChild(ts.pane);
+  $$(".term-pane").forEach((p) => p.classList.remove("active"));
   ts.pane.classList.add("active");
-  ts.tab.classList.add("active");
   state.activeTerm = ts;
-  requestAnimationFrame(() => { try { ts.fit.fit(); ts.term.focus(); } catch {} });
+  renderTermTabs();
+  refreshTermEmpty();
+  requestAnimationFrame(() => { try { ts.fit.fit(); ts.term.focus(); } catch { /* hidden */ } });
+}
+
+function refreshTermEmpty() {
+  [$("#term-panes"), $("#dv-term-panes")].forEach((hostEl) => {
+    const empty = hostEl.querySelector(".term-empty");
+    if (empty) empty.style.display = hostEl.querySelector(".term-pane") ? "none" : "";
+  });
 }
 
 function closeTerm(ts) {
-  try { ts.ws.close(); } catch {}
-  ts.term.dispose();
-  ts.tab.remove();
+  const live = ts.ws && ts.ws.readyState === 1 && ts.state !== "dead";
+  if (live) {
+    if (confirm("仅断开此标签？远端会话将继续在后台运行，可随时重新连接。")) {
+      detachTerm(ts);
+      return;
+    }
+    if (confirm("改为结束远端会话？远端 shell 将被终止，无法恢复。")) {
+      endTermSession(ts);
+      return;
+    }
+    return; // user cancelled both
+  }
+  removeTermTab(ts);
+}
+
+// detachTerm closes only the browser side: the remote PTY keeps running and
+// the session can be re-attached later (ring buffer replay).
+function detachTerm(ts) {
+  ts.manualClose = true;
+  clearTimeout(ts.reconnectTm);
+  try { ts.ws.close(); } catch { /* already closed */ }
+  removeTermTab(ts);
+}
+
+async function endTermSession(ts) {
+  ts.manualClose = true;
+  clearTimeout(ts.reconnectTm);
+  try { ts.ws.close(); } catch { /* already closed */ }
+  if (ts.session) {
+    try { await api("POST", "/api/term/close", { peer: ts.peer, session: ts.session }); }
+    catch (e) { toast(e.message, true); }
+  }
+  removeTermTab(ts);
+}
+
+function removeTermTab(ts) {
+  clearTimeout(ts.reconnectTm);
+  try { ts.term.dispose(); } catch { /* already disposed */ }
   ts.pane.remove();
   state.terms = state.terms.filter((x) => x !== ts);
   if (state.activeTerm === ts) {
     state.activeTerm = null;
-    if (state.terms.length) activateTerm(state.terms[0]);
+    const rest = state.terms.filter((t) => t.state !== "dead");
+    if (rest.length) activateTerm(rest[rest.length - 1]);
   }
+  renderTermTabs();
+  refreshTermEmpty();
+  renderStats();
 }
 
-function dropTermForPeer(peerID) {
-  state.terms.filter((t) => t.peer === peerID).forEach((t) => {
-    t.dead = true;
-  });
-}
-
-function fitTerm(ts) { try { ts.fit.fit(); } catch {} }
+function fitTerm(ts) { try { ts.fit.fit(); } catch { /* hidden */ } }
 
 window.addEventListener("resize", () => { if (state.activeTerm) fitTerm(state.activeTerm); });
 
 // ---------------------------------------------------------------- files ---
+// Two workspaces share the same rendering code: the files page binds its DOM
+// to state.fs (peer from the select), the device detail page binds its DOM to
+// state.dvfs (peer = the device being inspected).
 
-function renderFsPeers() {
-  const sel = $("#fs-peer");
-  const cur = sel.value;
-  sel.innerHTML = (state.status?.peers || []).map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("");
-  if (cur && [...sel.options].some((o) => o.value === cur)) sel.value = cur;
+function bindWorks() {
+  state.fs = makeWork($("#files-root"), () => $("#fs-peer").value);
+  state.dvfs = makeWork($("#dv-files-root"), () => state.device);
 }
 
-async function loadDir(side) {
-  const st = state.fs[side];
-  const peer = side === "remote" ? $("#fs-peer").value : "";
+function makeWork(rootEl, peerFn) {
+  const work = {
+    peerFn,
+    local: { path: "", entries: [], sel: null, el: null },
+    remote: { path: "", entries: [], sel: null, el: null },
+  };
+  rootEl.querySelectorAll(".pane").forEach((pane) => bindFilePane(pane, work));
+  const mid = rootEl.querySelector(".files-mid");
+  work.midPush = mid.querySelector(".mid-push");
+  work.midPull = mid.querySelector(".mid-pull");
+  work.midPush.addEventListener("click", () => midTransfer(work, "local"));
+  work.midPull.addEventListener("click", () => midTransfer(work, "remote"));
+  return work;
+}
+
+function bindFilePane(pane, work) {
+  const side = pane.dataset.side;
+  const st = work[side];
+  st.pathEl = pane.querySelector(".pane-path");
+  st.listEl = pane.querySelector(".pane-list");
+  pane.querySelectorAll(".pane-actions .icon-btn").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const act = b.dataset.act;
+      if (act === "up") {
+        st.path = parentPath(st.path);
+        loadDirWork(work, side);
+      } else if (act === "refresh") {
+        loadDirWork(work, side);
+      } else if (act === "mkdir") {
+        const n = prompt("文件夹名");
+        if (!n) return;
+        try {
+          await api("POST", "/api/fs/mkdir", { peer: work.peerFn(), path: joinPath(st.path, n) });
+          loadDirWork(work, side);
+        } catch (e) { toast(e.message, true); }
+      }
+    });
+  });
+  // Browser drag & drop cannot hand file contents to the daemon (no upload
+  // channel yet) — explain instead of silently doing the wrong thing.
+  if (side === "remote") {
+    pane.addEventListener("dragover", (e) => { e.preventDefault(); pane.classList.add("dropping"); });
+    pane.addEventListener("dragleave", () => pane.classList.remove("dropping"));
+    pane.addEventListener("drop", (e) => {
+      e.preventDefault();
+      pane.classList.remove("dropping");
+      toast("浏览器直传将在后续版本支持：请选中文件后点击「发送」。");
+    });
+  }
+}
+
+async function loadDirWork(work, side) {
+  const st = work[side];
+  const peer = side === "remote" ? work.peerFn() : "";
+  if (side === "remote" && !peer) {
+    st.pathEl.textContent = "先选择远端设备";
+    st.entries = [];
+    renderDir(work, side);
+    return;
+  }
   try {
     const res = await api("GET", `/api/fs/list?peer=${encodeURIComponent(peer)}&path=${encodeURIComponent(st.path)}`);
     st.path = res.path || "";
     st.entries = res.entries || [];
-    renderDir(side);
+    renderDir(work, side);
   } catch (e) {
-    if (!["unauthorized"].includes(e.message)) {
-      $(side === "local" ? "#path-local" : "#path-remote").textContent = "错误: " + e.message;
-    }
+    if (e.message !== "unauthorized") st.pathEl.textContent = "错误: " + e.message;
   }
 }
 
-function renderDir(side) {
-  const st = state.fs[side];
-  const pathEl = $(side === "local" ? "#path-local" : "#path-remote");
-  const listEl = $(side === "local" ? "#list-local" : "#list-remote");
-  pathEl.textContent = st.path || (side === "local" ? "本机" : "此电脑");
+function renderDir(work, side) {
+  const st = work[side];
+  const listEl = st.listEl;
+  st.pathEl.textContent = st.path || (side === "local" ? "本机" : "此电脑");
   listEl.innerHTML = "";
   for (const en of st.entries) {
     const row = document.createElement("div");
     row.className = "f-row " + (en.dir ? "dir" : "file");
-    const selected = (side === "local" ? state.fs.selLocal : state.fs.selRemote) === en.name;
+    const selected = st.sel === en.name;
     if (selected) row.style.background = "rgba(79,124,255,.15)";
     row.innerHTML = `<span class="f-ic">${en.dir ? "▸" : "▪"}</span>
       <span class="f-name" title="${esc(en.name)}">${esc(en.name)}</span>
@@ -432,22 +904,20 @@ function renderDir(side) {
       <span class="f-act"></span>`;
     row.querySelector(".f-name").addEventListener("click", () => {
       if (en.dir) {
-        const base = st.path || "";
-        st.path = base ? base.replace(/[\\/]+$/, "") + "/" + en.name : en.name;
-        loadDir(side);
+        st.path = joinPath(st.path, en.name);
+        loadDirWork(work, side);
       } else {
-        if (side === "local") state.fs.selLocal = en.name; else state.fs.selRemote = en.name;
-        renderDir(side);
+        st.sel = en.name;
+        renderDir(work, side);
       }
     });
     const act = row.querySelector(".f-act");
-    const sideName = side === "local" ? "本机" : "远端";
     if (!en.dir) {
       const send = document.createElement("button");
       send.className = "icon-btn";
       send.title = side === "local" ? "发送到远端" : "下载到本机";
       send.textContent = side === "local" ? "⇒" : "⇐";
-      send.addEventListener("click", () => transferFile(side, en.name));
+      send.addEventListener("click", () => transferFile(work, side, en.name));
       act.appendChild(send);
     }
     const ren = document.createElement("button");
@@ -455,91 +925,51 @@ function renderDir(side) {
     ren.addEventListener("click", async () => {
       const nn = prompt("重命名", en.name);
       if (!nn || nn === en.name) return;
-      const peer = side === "remote" ? $("#fs-peer").value : "";
-      const base = (st.path || "").replace(/[\\/]+$/, "");
       try {
-        await api("POST", "/api/fs/rename", { peer, from: base + "/" + en.name, to: base + "/" + nn });
-        loadDir(side);
+        await api("POST", "/api/fs/rename", { peer: work.peerFn(), from: joinPath(st.path, en.name), to: joinPath(st.path, nn) });
+        loadDirWork(work, side);
       } catch (e) { toast(e.message, true); }
     });
     const del = document.createElement("button");
     del.className = "icon-btn"; del.title = "删除"; del.textContent = "✕";
     del.addEventListener("click", async () => {
+      const sideName = side === "local" ? "本机" : "远端";
       if (!confirm(`删除 ${sideName} ${en.name}${en.dir ? "（含内容）" : ""}？`)) return;
-      const peer = side === "remote" ? $("#fs-peer").value : "";
-      const base = (st.path || "").replace(/[\\/]+$/, "");
       try {
-        await api("POST", "/api/fs/remove", { peer, path: base + "/" + en.name, recursive: !!en.dir });
-        loadDir(side);
+        await api("POST", "/api/fs/remove", { peer: work.peerFn(), path: joinPath(st.path, en.name), recursive: !!en.dir });
+        loadDirWork(work, side);
       } catch (e) { toast(e.message, true); }
     });
     act.appendChild(ren); act.appendChild(del);
     listEl.appendChild(row);
   }
   if (!st.entries.length) listEl.innerHTML = `<div class="empty" style="padding:12px">空目录</div>`;
+  updateMid(work);
 }
 
-$$(".pane").forEach((pane) => {
-  const side = pane.id === "pane-local" ? "local" : "remote";
-  pane.querySelectorAll(".pane-actions .icon-btn").forEach((b) => {
-    b.addEventListener("click", async () => {
-      const act = b.dataset.act;
-      const st = state.fs[side];
-      if (act === "up") {
-        const norm = st.path.replace(/[\\/]+$/, "");
-        const i = Math.max(norm.lastIndexOf("/"), norm.lastIndexOf("\\"));
-        st.path = i > 0 ? norm.slice(0, i) : (i === 0 ? norm.slice(0, 1) : "");
-        loadDir(side);
-      } else if (act === "refresh") {
-        loadDir(side);
-      } else if (act === "mkdir") {
-        const n = prompt("文件夹名");
-        if (!n) return;
-        const peer = side === "remote" ? $("#fs-peer").value : "";
-        const base = (st.path || "").replace(/[\\/]+$/, "");
-        try {
-          await api("POST", "/api/fs/mkdir", { peer, path: base + "/" + n });
-          loadDir(side);
-        } catch (e) { toast(e.message, true); }
-      }
-    });
-  });
-  // drag & drop upload (local -> remote)
-  if (side === "local") return;
-  pane.addEventListener("dragover", (e) => { e.preventDefault(); pane.classList.add("dropping"); });
-  pane.addEventListener("dragleave", () => pane.classList.remove("dropping"));
-  pane.addEventListener("drop", async (e) => {
-    e.preventDefault(); pane.classList.remove("dropping");
-    for (const f of e.dataTransfer.files) {
-      await pushUpload(f);
-    }
-  });
-});
-
-async function pushUpload(file) {
-  // Save the picked file under a temp name via the browser? The daemon has
-  // no browser access, so uploads go through a two-step: local side chooses
-  // the file again from disk by path. Instead we use File API -> not
-  // supported across daemon; fallback: instruct manual path transfer.
-  const peer = $("#fs-peer").value;
-  if (!peer) { toast("请先选择远端设备", true); return; }
-  const remotePath = joinPath(state.fs.remote.path, file.name);
-  const localGuess = file.name;
-  try {
-    await api("POST", "/api/xfer/push", { peer, local: localGuess, remote: remotePath, conflict: "rename" });
-    toast("已提交传输: " + file.name + "（需文件位于 rtd 工作目录）");
-  } catch (e) { toast(e.message, true); }
+function selEntry(work, side) {
+  const st = work[side];
+  return st.entries.find((e) => e.name === st.sel);
 }
 
-$("#fs-peer").addEventListener("change", () => { state.fs.remote.path = ""; loadDir("remote"); });
+function updateMid(work) {
+  const l = selEntry(work, "local");
+  const r = selEntry(work, "remote");
+  work.midPush.disabled = !(l && !l.dir);
+  work.midPull.disabled = !(r && !r.dir);
+}
 
-function transferFile(side, name) {
-  const peer = $("#fs-peer").value;
+function midTransfer(work, side) {
+  const en = selEntry(work, side);
+  if (!en || en.dir) return;
+  transferFile(work, side, en.name);
+}
+
+function transferFile(work, side, name) {
+  const peer = work.peerFn();
   if (!peer) { toast("请先选择远端设备", true); return; }
-  const baseR = (state.fs.remote.path || "").replace(/[\\/]+$/, "");
-  const baseL = (state.fs.local.path || "").replace(/[\\/]+$/, "");
-  const remotePath = baseR ? baseR + "/" + name : name;
-  const localPath = baseL ? baseL + "/" + name : name;
+  const remotePath = joinPath(work.remote.path, name);
+  const localPath = joinPath(work.local.path, name);
   (async () => {
     try {
       if (side === "local") {
@@ -552,15 +982,36 @@ function transferFile(side, name) {
   })();
 }
 
-function joinPath(base, name) {
-  const b = (base || "").replace(/[\\/]+$/, "");
-  return b ? b + "/" + name : name;
+function renderFsPeers() {
+  const sel = $("#fs-peer");
+  const cur = sel.value;
+  sel.innerHTML = (state.status?.peers || []).map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("");
+  if (cur && [...sel.options].some((o) => o.value === cur)) sel.value = cur;
 }
+
+$("#fs-peer").addEventListener("change", () => {
+  Object.assign(state.fs.remote, { path: "", entries: [], sel: null });
+  loadDirWork(state.fs, "remote");
+});
 
 // transfers ----------------------------------------------------------
 
 function onXferEvent(p) {
   if (!p || !p.id) return;
+  const prev = state.xfers.get(p.id);
+  if (prev && p.state === "running" && prev.state === "running" && prev._t) {
+    const dt = (Date.now() - prev._t) / 1000;
+    if (dt > 0) {
+      const sp = Math.max(0, (p.done - prev.done) / dt);
+      p._speed = sp > 0 ? sp : prev._speed;
+      p._t = Date.now();
+    } else {
+      p._speed = prev._speed; p._t = prev._t;
+    }
+  } else {
+    p._speed = 0;
+    p._t = Date.now();
+  }
   state.xfers.set(p.id, p);
   renderXfers();
 }
@@ -568,20 +1019,36 @@ function onXferEvent(p) {
 function renderXfers() {
   const list = $("#xfer-list");
   list.innerHTML = "";
-  for (const [id, p] of [...state.xfers.entries()].slice(-30)) {
+  for (const [, p] of [...state.xfers.entries()].slice(-30)) {
     const row = document.createElement("div");
     row.className = "xfer-row";
     const pct = p.size > 0 ? Math.min(100, Math.round((100 * p.done) / p.size)) : 0;
+    const canceled = p.state === "error" && p.err === "canceled";
+    const stTxt = p.state === "running"
+      ? fmtSize(p.done) + (p.size ? " / " + fmtSize(p.size) : "") + (p._speed ? " · " + fmtSize(p._speed) + "/s" : "")
+      : canceled ? "已取消"
+      : p.state === "done" ? "已完成"
+      : p.state + (p.err ? ": " + esc(p.err) : "");
     row.innerHTML = `
       <div class="x-top">
         <span class="x-name">${p.direction === "push" ? "↑" : "↓"} ${esc(p.name || p.local_path)}</span>
-        <span class="x-state ${p.state}">${p.state === "running" ? fmtSize(p.done) + (p.size ? " / " + fmtSize(p.size) : "") : p.state + (p.err ? ": " + esc(p.err) : "")}</span>
+        <span class="x-stwrap">
+          <span class="x-state ${canceled ? "canceled" : p.state}">${stTxt}</span>
+          ${p.state === "running" ? `<button class="icon-btn x-cancel" title="取消传输">✕</button>` : ""}
+        </span>
       </div>
       <div class="xbar"><div style="width:${p.state === "done" ? 100 : pct}%"></div></div>`;
+    if (p.state === "running") row.querySelector(".x-cancel").addEventListener("click", () => cancelXfer(p.id));
     list.appendChild(row);
   }
   const running = [...state.xfers.values()].filter((x) => x.state === "running").length;
   $("#fs-progress-summary").textContent = running ? `${running} 个传输中` : "";
+  $("#dv-xfer-summary").textContent = running ? `${running} 个传输中（详见「文件」页）` : "";
+  renderStats();
+}
+
+async function cancelXfer(id) {
+  try { await api("POST", "/api/xfer/cancel", { id }); } catch (e) { toast(e.message, true); }
 }
 
 $("#xfer-clear").addEventListener("click", () => { state.xfers.clear(); renderXfers(); });
@@ -598,31 +1065,36 @@ function renderFwdPeers() {
 async function refreshFwd() {
   renderFwdPeers();
   try {
-    const res = await api("GET", "/api/fwd");
-    const list = $("#fwd-list");
-    list.innerHTML = "";
-    const rules = res.rules || [];
-    if (!rules.length) { list.innerHTML = `<div class="empty">暂无规则</div>`; return; }
-    for (const r of rules) {
-      const active = (res.active || {})[r.id];
-      const peer = (state.status?.peers || []).find((p) => p.id === r.peer_id);
-      const row = document.createElement("div");
-      row.className = "peer-row" + (active ? " st-connected" : "");
-      row.innerHTML = `
-        <span class="dot"></span>
-        <div class="p-name">-${r.mode}</div>
-        <div class="p-meta mono">${esc(peer?.name || shortID(r.peer_id))}: ${esc(r.listen_host || "127.0.0.1")}:${r.listen_port} → ${esc(r.target_host)}:${r.target_port}</div>
-        <div class="p-actions"><span class="dim" style="font-size:12px">${active ? "生效中" : "等待连接"}</span></div>`;
-      const act = row.querySelector(".p-actions");
-      const del = document.createElement("button");
-      del.className = "btn small danger"; del.textContent = "删除";
-      del.addEventListener("click", async () => {
-        try { await api("POST", "/api/fwd/remove", { id: r.id }); refreshFwd(); } catch (e) { toast(e.message, true); }
-      });
-      act.appendChild(del);
-      list.appendChild(row);
-    }
-  } catch (e) { toast(e.message, true); }
+    state.fwd = await api("GET", "/api/fwd");
+  } catch (e) { toast(e.message, true); return; }
+  renderFwdInto($("#fwd-list"));
+  renderFwdInto($("#dv-fwd-list"));
+}
+
+function renderFwdInto(listEl) {
+  const data = state.fwd;
+  if (!data || !listEl) return;
+  listEl.innerHTML = "";
+  const rules = data.rules || [];
+  if (!rules.length) { listEl.innerHTML = `<div class="empty">暂无规则</div>`; return; }
+  for (const r of rules) {
+    const active = (data.active || {})[r.id];
+    const row = document.createElement("div");
+    row.className = "peer-row" + (active ? " st-connected" : "");
+    row.innerHTML = `
+      <span class="dot"></span>
+      <div class="p-name">-${r.mode}</div>
+      <div class="p-meta mono">${esc(peerName(r.peer_id))}: ${esc(r.listen_host || "127.0.0.1")}:${r.listen_port} → ${esc(r.target_host)}:${r.target_port}</div>
+      <div class="p-actions"><span class="dim" style="font-size:12px">${active ? "生效中" : "等待连接"}</span></div>`;
+    const act = row.querySelector(".p-actions");
+    const del = document.createElement("button");
+    del.className = "btn small danger"; del.textContent = "删除";
+    del.addEventListener("click", async () => {
+      try { await api("POST", "/api/fwd/remove", { id: r.id }); refreshFwd(); } catch (e) { toast(e.message, true); }
+    });
+    act.appendChild(del);
+    listEl.appendChild(row);
+  }
 }
 
 $("#fwd-mode").addEventListener("change", () => {

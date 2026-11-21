@@ -51,6 +51,7 @@ type Daemon struct {
 	fwd   *fwd.Service
 	pair  *PairService
 	mdns  *discover.MDNS
+	acts  *ActivityLog
 
 	events    *web.EventHub
 	hubMu     sync.Mutex
@@ -95,7 +96,7 @@ func New(opts Options) (*Daemon, error) {
 
 	hub := NewEventHub()
 
-	d := &Daemon{store: store, id: id, log: log, events: hub}
+	d := &Daemon{store: store, id: id, log: log, events: hub, acts: NewActivityLog()}
 	d.term = term.NewService(log)
 	d.filex = filex.NewService(log)
 	d.fwd = fwd.NewService(log, store)
@@ -121,9 +122,11 @@ func New(opts Options) (*Daemon, error) {
 		if ev.Type == "peer_up" {
 			go d.applyRules(ev.PeerID)
 		}
+		d.recordPeerEvent(ev)
 	})
 	d.filex.OnProgress(func(p filex.Progress) {
 		hub.Publish("xfer", p.PeerID, p)
+		d.recordXferProgress(p)
 	})
 	d.fwd.SetLookupPeer(mgr.Get)
 	_ = logClose
@@ -431,9 +434,14 @@ func (d *Daemon) webAPI() *web.API {
 			// Fast path: already paired and reachable — just connect.
 			if p, err := d.mgr.ConnectAddr(ctx, addr); err == nil {
 				peer, _ := d.store.Peer(p.ID)
+				d.recordActivity("pair", p.ID, "已连接已配对设备")
 				return peer, nil
 			}
-			return d.pair.PairWith(ctx, addr, code)
+			peer, err := d.pair.PairWith(ctx, addr, code)
+			if err == nil && peer != nil {
+				d.recordActivity("pair", peer.ID, "配对成功")
+			}
+			return peer, err
 		},
 		ListDir: func(ctx context.Context, peerArg, path string) (any, error) {
 			peer, err := d.resolvePeerArg(peerArg)
@@ -521,6 +529,7 @@ func (d *Daemon) webAPI() *web.API {
 			if err := d.store.AddFwdRule(rule); err != nil {
 				return err
 			}
+			d.recordActivity("fwd", rule.PeerID, fmt.Sprintf("添加转发规则 -%s %d→%s:%d", rule.Mode, rule.ListenPort, rule.TargetHost, rule.TargetPort))
 			if peer, ok := d.mgr.Get(rule.PeerID); ok {
 				if err := d.fwd.ApplyRule(rule, peer); err != nil {
 					return err
@@ -546,6 +555,7 @@ func (d *Daemon) webAPI() *web.API {
 				return err
 			}
 			d.fwd.StopRule(rule)
+			d.recordActivity("fwd", rule.PeerID, fmt.Sprintf("删除转发规则 -%s %d→%s:%d", rule.Mode, rule.ListenPort, rule.TargetHost, rule.TargetPort))
 			return nil
 		},
 		FwdActive: d.fwd.ActiveRules,
@@ -563,7 +573,26 @@ func (d *Daemon) webAPI() *web.API {
 			if err != nil {
 				return nil, 0, nil, err
 			}
+			if sessionID != 0 {
+				d.recordActivity("term", peer.ID, fmt.Sprintf("恢复终端会话 #%d", sessionID))
+			} else {
+				d.recordActivity("term", peer.ID, fmt.Sprintf("打开终端会话 #%d", cs.ID))
+			}
 			return cs, cs.ID, cs.Resize, nil
+		},
+		TermClose: func(peerArg string, session uint64) error {
+			peer, err := d.resolvePeerArg(peerArg)
+			if err != nil {
+				return err
+			}
+			if err := term.ClientCloseByID(peer, session); err != nil {
+				return err
+			}
+			d.recordActivity("term", peer.ID, fmt.Sprintf("结束终端会话 #%d", session))
+			return nil
+		},
+		Activity: func(limit int) any {
+			return map[string]any{"items": d.acts.List(limit)}
 		},
 	}
 }
