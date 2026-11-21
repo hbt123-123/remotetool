@@ -50,7 +50,8 @@
 
 **已知缺口（诚实性）**：hub 场景下无法廉价得知对端是否已向 hub 注册
 （resolve 有限流 10/s 且 hub 无列表 API），故 hub 链路只映射为 `reachable`。
-待阶段 2 心跳协议（设备↔hub 周期重注册 + 设备间 ping）落地后补 `online` 的 hub 证据。
+阶段 4 已给设备↔hub 补上注册刷新（60s `refresh` + hub 5min TTL）与自动重连，
+但"对端已注册"的 hub 证据仍缺——待 resolve 按需探测（阶段 2 设备间 ping 一并考虑）。
 
 ## 3. 统一连接生命周期
 
@@ -109,7 +110,7 @@ SSE 事件 `peer_connecting` / `peer_up`（富 payload：name/platform/version/c
 
 ### 5.1 cmd 命名与未来拆分路径
 
-当前刻意维持三个二进制（AGENTS.md 规则 1：不过早拆分程序）：
+当前刻意维持三个二进制（决策：不过早拆分程序——不为架构漂亮增加部署复杂度）：
 
 | 二进制 | 当前职责 | 对应目标结构概念 |
 |---|---|---|
@@ -137,13 +138,14 @@ SSE 事件 `peer_connecting` / `peer_up`（富 payload：name/platform/version/c
 
 **认证与连接逻辑唯一性约束**：所有 Feature 与新增能力必须复用 `session.Manager` 的
 连接与认证（Feature.AttachRPC/HandleStream），禁止自建拨号/认证路径；
-所有 RPC handler 与 HandleStream 必须校验归属（详见 AGENTS.md「架构边界」）。
+所有 RPC handler 与 HandleStream 必须校验归属与设备权限，资源不存在与
+权限拒绝共用统一措辞（防存在性探测）。
 
 ## 7. 已知简化与后续阶段
 
-- **心跳**：无应用层心跳；活性靠 QUIC keepalive（会话内）与 mDNS 广播（局域网在线）。
-  hub 场景的精确「在线」待阶段 2。
-- **hubclient 无自动重连**：hub 链路断开后静默离线，下次 Resolve/Relay 惰性重拨。
+- **心跳（部分落地）**：设备↔hub 已有注册刷新（60s `refresh` + hub 侧 5min
+  TTL，断线由 KeepAlive 指数退避重连——阶段 4）；设备↔设备间仍无应用层
+  ping，活性靠 QUIC keepalive（会话内）与 mDNS 广播（局域网在线）。
 - **活动日志为内存实现**：`internal/daemon/activity.go` 的 200 条环形缓冲，重启即清空
   （定位是"最近操作"信息流而非审计；持久记录由 slog 落 rtd.log）。
 - **fwd 规则状态**：owner 侧内存状态表（`fwd.Service.status`）记录每条规则的

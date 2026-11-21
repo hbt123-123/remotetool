@@ -44,7 +44,8 @@
 - **控制流**（每连接 1 条，拨号方打开）：u32 前缀 JSON 帧多路复用请求/响应/
   通知（`internal/proto/rpc.go`）。方法：`hello`（交换 ID/名称/平台/版本/能力，
   后三个可选字段，老版本对端缺省为空）、`pair.*`、`fs.*`、`xfer.*`（含 `xfer.cancel`）、
-  `term.open/resize/close/list`、`fwd.listen/unlisten/grant`。
+  `term.open/resize/close/list`、`fwd.listen/unlisten/grant`；hub 信道另有
+  `reg`/`refresh`/`resolve`/`relay`。
 - **数据流**（按需多条）：首字节信道类型 + u32 前缀 JSON 头，其后为纯二进制：
   - `ChanTerm`：会话 id 定位，之后为 PTY 原始字节（输入输出同流）；
   - `ChanFile`：传输 id 定位，从续传偏移起的文件字节；
@@ -81,6 +82,9 @@
   kill-on-close Job Object 树杀，`Wait/Kill/Resize` 以互斥锁保护句柄生命周期。
 - **归属隔离**：会话属于 `term.open` 的调用设备；`term.resize/close/list` 与
   数据流挂接只作用于自己的会话，他人会话一律按“不存在”处理（不泄露存在性）。
+- **设备权限门**：每次 RPC 与数据流挂接前按调用方查 `config.Peer.Perm`（本机
+  配置，见 §8），被收权的设备得到与“会话不存在”相同的措辞——权限缺失与
+  资源缺失不可区分。
 - 前端 xterm.js（vendor 本地化，无 CDN）；CLI `rt term` 原始模式
   （unix SIGWINCH / windows 轮询 resize）。
 
@@ -103,9 +107,18 @@
    Web UI 的“本机”面板以空 `peer` 走本地 fs 处理器（`peer == ""` 不参与
    设备解析，杜绝空前缀命中第一个配对设备的误路由）。
 
-fs 浏览操作：`fs.list/mkdir/rename/remove/stat`（`fs.list` 空路径在 Windows
-返回盘符列表）。目录推送：`filepath.WalkDir` 逐文件 push。进度经事件总线
-（SSE）推送 Web UI。
+fs 浏览操作：`fs.list/mkdir/rename/remove/stat`。目录推送：`filepath.WalkDir`
+逐文件 push。进度经事件总线（SSE）推送 Web UI。
+
+**文件授权目录（file_roots）**：来自远端设备的每个路径（fs.\* 与 xfer.push
+的落盘路径、xfer.pull 的源路径）都必须落在该设备在本机的授权目录内
+（`config.Peer.FileRoots`；缺省 = 本机用户主目录，显式空 = 全拒）。
+路径先绝对化/`Clean`、展开已存在部分的符号链接，再做授权根前缀匹配
+（Windows 盘符大小写不敏感）；越界统一报 `path outside allowed roots`
+（已配对设备可信，报错用于排错）。相对路径按本机主目录解析（保住
+`rt cp f.bin 设备B:Downloads/x.zip` 的写法）。本机面板（`peer==""`）是
+操作者本人，不受此限制。`fs.list` 空路径返回授权根列表（浏览器的起始视图），
+不再枚举盘符。
 
 ## 6. 发现与广域网
 
@@ -113,7 +126,11 @@ fs 浏览操作：`fs.list/mkdir/rename/remove/stat`（`fs.list` 空路径在 Wi
   （`internal/discover`）；发现条目 60s 未再广播即过期（Known() 只保留活跃宣告）。
 - **自建 hub**（`cmd/hub` + `internal/hub` + `internal/session/hubclient.go`）：
   - 设备→hub：QUIC（ALPN `rtd-hub/1`），`reg {token, id}` 注册、
-    `resolve` 地址解析、`relay` 中继请求；
+    `refresh` 幂等注册刷新、`resolve` 地址解析、`relay` 中继请求；
+  - **注册 TTL**：注册 5 分钟无 refresh 即被摘除（resolve/relay 均不再应答，
+    后台 janitor 关闭其连接），设备假死不再长期占表；客户端每 60s refresh
+    一次，断线后由 KeepAlive 循环指数退避（1s→5min）自动重连；
+    hub 与 rtd 必须随版本同步升级（老客户端不 refresh 会在 TTL 后被摘）；
   - **加密中继**：请求方开数据流写 `{token, dst}`，hub 通知目的端
     `relay.incoming {src, token}`，目的端回开流 `{token}`，hub 按 token 配对
     后纯转发两条流（早到流缓存防竞态）。两条流内部再跑一层**设备证书的
@@ -137,12 +154,24 @@ fs 浏览操作：`fs.list/mkdir/rename/remove/stat`（`fs.list` 空路径在 Wi
 
 ## 8. 安全清单
 
+安全分三层：**设备身份**（下面前四项）→ **会话授权**（连接即已通过身份
+认证，归属校验见 §4/§5）→ **操作权限**（本机按设备收窄，见后两项）。
+
 - [x] 配对码不离开设备（SPAKE2），错码/中间人单测覆盖
 - [x] 已配对连接证书钉扎，密钥更换即拒绝
 - [x] 未配对设备只在存在有效邀请时进入配对路径，否则拒绝
 - [x] 中继只见密文（内层 TLS）
-- [x] Web UI 仅回环 + token
+- [x] Web UI 仅回环 + token；cookie 认证的写请求校验 Origin（CSRF）；
+      SSE 认证走 HttpOnly cookie，token 不再进 URL
 - [x] 转发规则本地落盘，监听默认 127.0.0.1
+- [x] 设备权限开关（`Peer.Perm`）：终端/文件/转发可按设备关闭，
+      拒绝话术与资源不存在一致（无存在性泄露）
+- [x] 文件授权目录（`Peer.FileRoots`）：远端指定路径必须在根内
+      （Clean + 符号链接展开 + 前缀匹配），默认主目录、可全拒
+- [x] 转发拨号白名单（`Peer.FwdAllowHosts`）：`fwd.grant` 的目标必须
+      获本机授权（主机/IP/CIDR），默认仅回环
+- [x] 凭据不入日志：web token 的完整 URL 只打印到控制台，rtd.log 不落
+      token；web 层测试断言日志无凭据
 - [ ] hub 多租户隔离 / 速率限制（单用户自建场景暂不需要）
 
 ## 9. 验证记录（2026-11-07，本机双实例 + hub）
@@ -151,3 +180,14 @@ fs 浏览操作：`fs.list/mkdir/rename/remove/stat`（`fs.list` 空路径在 Wi
 -L/-R 转发 HTTP 实测、浏览器与 CLI 终端交互、直连破坏后中继路径
 （连接/列目录/传输/终端）全部通过；windows/linux/android（arm64、amd64）
 交叉编译产出静态/PIE 二进制。
+
+## 10. 自动化测试（2026-11-21，阶段 4 起）
+
+- 单元层：各包 `*_test.go`（配对防爆破/身份/归属/路径授权/白名单/权限门/
+  hub TTL/web 层 401 与 CSRF）。
+- 进程层（`tests/`，CI ubuntu 全量 + `-race`；windows 跑 `-short` 单测层）：
+  `tests/internal/harness` 构建 rtd/hub 并以隔离配置目录、独立端口拉起
+  真实进程，经鉴权 Web API 驱动：`integration/`（会话生命周期、终端回放、
+  传输往返与取消、转发与白名单、设备状态）与 `e2e/`（配对防爆破、
+  日志无凭据、未授权拒绝、hub 中继与重启恢复）。
+- 真机矩阵与长时间运行清单：`docs/platform-matrix.md`。

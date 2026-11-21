@@ -11,6 +11,10 @@
 无账号体系、无第三方服务器——局域网 mDNS 直连；跨公网用你**自建**的 hub，
 中继只传输密文。
 
+安全分层：配对只是身份确认，**能力可以按设备收窄**——每台配对设备可分别
+关闭终端/文件/转发，文件访问限定在授权目录内（默认主目录），转发拨号目标
+默认仅允许回环（白名单可放行内网段）。均在 Web UI 设备详情页「权限」页配置。
+
 ## 快速开始
 
 ### 1. 构建
@@ -79,6 +83,8 @@ hub --listen :27190 --token 换个长随机串
 ```
 
 安卓端定位为主控端 + 文件传输对端（浏览/收发文件、当远程终端的客户端）。
+后台存活（wake-lock / termux-services / 电池白名单）、网络切换与
+mDNS 限制见 [docs/android.md](docs/android.md)。
 后续将提供内嵌 Web UI 的薄壳 APK。
 
 ## 架构一览
@@ -105,16 +111,21 @@ x/sys、x/term、x/net（详见 go.mod）。
 
 ## 已验证
 
-- 本机双实例：配对（正确码通过/错码拒绝）、连接、远程列目录
-- 8MB 文件推送/拉取 SHA-256 一致；预置半成品续传（push/pull 双向）通过
-- 端口转发 `-L`/`-R` 实测 HTTP 经隧道访问对端 Web 服务
-- 浏览器 xterm.js 终端与 CLI `rt term` 交互正常
-- 直连地址被破坏时自动经 hub 中继：连接/列目录/传输/终端全部通过
+自动化（CI：ubuntu 全量含进程级 e2e + windows 单测层，均带 -race）：
+
+- 双实例直连：配对（错误码退避/5 次作废/单次有效）、连接断开重连、终端
+  会话恢复回放、文件推送/拉取/取消重试、路径穿越拒绝、转发回环规则与
+  目标白名单拒绝、Web 未授权 401、`rtd.log` 无 token
+- hub：注册 TTL 摘除、resolve/relay 只答新鲜设备、hub 重启后设备自动重连、
+  直连地址被破坏时自动经中继恢复
 - 交叉编译：windows/amd64、linux/amd64、linux/arm64、android/arm64
+
+真机矩阵（Windows/Linux/Android 组合与 Android 后台行为）按
+[docs/platform-matrix.md](docs/platform-matrix.md) 逐项执行。
 
 ## 已知限制（v0.1）
 
 - 老 Windows（<10 1809）无 ConPTY，终端走管道兜底（无 ANSI、推荐 chcp 65001）
-- Linux/安卓二进制为编译冒烟，建议在真机上先行验证
+- Android 端为编译冒烟 + 文档指引，真机验证按 platform-matrix 进行
 - UDP 打洞 P2P 直连尚未实现（当前直连失败即走 hub 中继）
 - Android APK 薄壳、SOCKS5 出站代理在路线图中

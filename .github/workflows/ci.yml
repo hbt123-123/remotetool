@@ -6,7 +6,11 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -14,12 +18,44 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: gofmt
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "gofmt needed on:"
+            echo "$out"
+            exit 1
+          fi
+
       - name: Vet
         run: go vet ./...
 
-      - name: Test
-        run: go test -race ./...
+      # Linux runs the whole suite including the process-level tests/ trees
+      # (they build rtd/hub and drive them over the web API). Windows runs
+      # only the -short unit layer: the process suite is platform-neutral but
+      # PTY/ConPTY timing on shared runners made it flaky, and the full
+      # matrix's job is catching platform-specific unit regressions.
+      - name: Test (full, with race)
+        if: matrix.os == 'ubuntu-latest'
+        run: go test -race -timeout 18m ./...
 
+      - name: Test (short, with race)
+        if: matrix.os == 'windows-latest'
+        run: go test -race -short -timeout 10m ./...
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Cross-compiles all release targets (windows/linux/android) — the
+      # compile smoke test for every platform.
       - name: Build release
         run: |
           chmod +x build.sh

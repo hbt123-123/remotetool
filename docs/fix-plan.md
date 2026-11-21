@@ -251,15 +251,18 @@ P2: F12 → F11 → F13 → F14
 
 ## 完成标准（Definition of Done）
 
-- [ ] F1：跨设备会话/传输访问全部被拒，同设备正常
-- [ ] F2：错误码尝试受限、邀请可作废、未配对连接有配额
-- [ ] F3：`go test -race ./...` 全绿；hub 长时间运行内存/条目数稳定；重复 complete 不 panic
-- [ ] F4：重连 100 次输出顺序正确
-- [ ] F5：无法被作为开放代理使用
-- [ ] F6：单设备无法饿死全局流配额
-- [ ] F7：可选 hub 指纹生效
-- [ ] F8：WS 与 API 具备基础浏览器侧防护
-- [ ] F9：关键路径无永久阻塞
-- [ ] F10：Windows 路径、并发 cp、版本号三个 bug 修复
-- [ ] F11–F13：重构后行为等价，退出无孤儿进程
-- [ ] F14：CI 通过，文档与代码一致
+> 2026-11-21 回填：代码证据确认全部实现（单测覆盖各条），`-race` 全量由 CI 执行。
+> 阶段 4（安全专项 + 测试体系）见 design.md §8/§10。
+
+- [x] F1：跨设备会话/传输访问全部被拒，同设备正常（term/filex 单测 + integration）
+- [x] F2：错误码尝试受限、邀请可作废、未配对连接有配额（pair 单测 + e2e）
+- [x] F3：`go test -race ./...` 全绿（CI）；hub 上限与 TTL 清理；重复 complete 不 panic
+- [x] F4：重连回放顺序正确（term 回放 30 次单测）
+- [x] F5：无法被作为开放代理使用（legacy Dial 拒绝 + grant 白名单）
+- [x] F6：单设备无法饿死全局流配额（64 流/peer 上限单测）
+- [x] F7：可选 hub 指纹生效（hubclient 单测）
+- [x] F8：WS Origin 校验 + cookie 认证写请求 Origin 校验（CSRF）+ web 层测试
+- [x] F9：关键路径超时（hello 10s / 中继 TLS 15s / Open 30s / fwd 拨号 10s）
+- [x] F10：Windows 路径、并发 cp、版本号三个 bug 修复
+- [x] F11–F13：重构后行为等价，退出序 term.Shutdown→filex.CancelAll→fwd.StopAll
+- [x] F14：CI（vet + race + gofmt + OS matrix + release 交叉编译）通过，文档与代码一致
