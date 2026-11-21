@@ -156,6 +156,9 @@ type API struct {
 	// TermClose terminates a remote terminal session opened by this device
 	// (the WS detach alone leaves the PTY running for later re-attach).
 	TermClose func(peerArg string, session uint64) error
+	// TermList lists this device's live terminal sessions on a peer (the UI
+	// restores tabs from it after a refresh).
+	TermList func(peerArg string) (any, error)
 
 	// Activity returns recent daemon operations for the UI feed (bounded
 	// in-memory ring, oldest first).
@@ -429,13 +432,20 @@ func (s *Server) termWS(wsconn *websocket.Conn) {
 	_, _ = fmt.Sscanf(q.Get("cols"), "%d", &cols)
 	_, _ = fmt.Sscanf(q.Get("rows"), "%d", &rows)
 
-	stream, _, resize, err := s.api.TermDial(peerArg, cols, rows, sessionID)
+	stream, sid, resize, err := s.api.TermDial(peerArg, cols, rows, sessionID)
 	if err != nil {
-		_, _ = wsconn.Write([]byte("terminal error: " + err.Error()))
+		// A structured error frame (not plain text) lets the UI tell a dead
+		// session from a network blip and stop its reconnect loop.
+		b, _ := json.Marshal(map[string]string{"error": err.Error()})
+		_, _ = wsconn.Write(b)
 		_ = wsconn.Close()
 		return
 	}
 	defer stream.Close()
+	// Announce the session id so the client can re-attach to the same PTY
+	// after a reconnect or a page refresh (app.js parses {"session":N} text
+	// frames and passes the id back via the ?session= query parameter).
+	_, _ = wsconn.Write([]byte(fmt.Sprintf(`{"session":%d}`, sid)))
 
 	done := make(chan struct{}, 2)
 	// remote -> browser (binary frames)

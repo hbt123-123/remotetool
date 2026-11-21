@@ -11,6 +11,14 @@ import (
 // detach — closing the socket only detaches and leaves the PTY running.
 func (s *Server) termAPI(w http.ResponseWriter, r *http.Request) {
 	switch {
+	case r.URL.Path == "/api/term/list" && r.Method == http.MethodGet:
+		res, err := s.api.TermList(r.URL.Query().Get("peer"))
+		if err != nil {
+			errJSON(w, err)
+			return
+		}
+		writeJSON(w, map[string]any{"sessions": res})
+
 	case r.URL.Path == "/api/term/close" && r.Method == http.MethodPost:
 		body, err := readBody[struct {
 			Peer    string `json:"peer"`

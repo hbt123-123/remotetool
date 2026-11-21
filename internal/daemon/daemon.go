@@ -259,25 +259,40 @@ func (d *Daemon) resolvePeerArg(arg string) (*session.Peer, error) {
 	// some callers pass a deadline-less context, so bound the connect.
 	cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	id, err := d.lookupPeerArg(arg)
+	if err != nil {
+		return nil, err
+	}
+	return d.mgr.Connect(cctx, id)
+}
+
+// lookupPeerArg maps a peer argument (id, exact name or id prefix) to its id
+// without dialing. An empty argument is an error: the prefix match below
+// would otherwise bind "" to the first paired device (the web UI's local
+// filesystem pane sends "" and must get this device, not a peer).
+func (d *Daemon) lookupPeerArg(arg string) (string, error) {
+	if arg == "" {
+		return "", fmt.Errorf("no paired device matches %q", arg)
+	}
 	peers := d.store.Peers()
-	var byName *config.Peer
+	var byName string
 	for i := range peers {
 		if peers[i].ID == arg {
-			return d.mgr.Connect(cctx, peers[i].ID)
+			return arg, nil
 		}
 		if peers[i].Name == arg {
-			byName = &peers[i]
+			byName = peers[i].ID
 		}
 	}
-	if byName != nil {
-		return d.mgr.Connect(cctx, byName.ID)
+	if byName != "" {
+		return byName, nil
 	}
 	for i := range peers {
 		if len(peers[i].ID) >= len(arg) && peers[i].ID[:len(arg)] == arg {
-			return d.mgr.Connect(cctx, peers[i].ID)
+			return peers[i].ID, nil
 		}
 	}
-	return nil, fmt.Errorf("no paired device matches %q", arg)
+	return "", fmt.Errorf("no paired device matches %q", arg)
 }
 
 // ConnectedView is the web's view of a live connection.
@@ -444,6 +459,11 @@ func (d *Daemon) webAPI() *web.API {
 			return peer, err
 		},
 		ListDir: func(ctx context.Context, peerArg, path string) (any, error) {
+			if peerArg == "" {
+				// The web UI's "this device" pane: serve the local filesystem
+				// through the same handlers as the RPC surface.
+				return d.filex.ListLocal(path)
+			}
 			peer, err := d.resolvePeerArg(peerArg)
 			if err != nil {
 				return nil, err
@@ -451,6 +471,9 @@ func (d *Daemon) webAPI() *web.API {
 			return d.filex.ListDir(ctx, peer, path)
 		},
 		Mkdir: func(ctx context.Context, peerArg, path string) error {
+			if peerArg == "" {
+				return d.filex.MkdirLocal(path)
+			}
 			peer, err := d.resolvePeerArg(peerArg)
 			if err != nil {
 				return err
@@ -458,6 +481,9 @@ func (d *Daemon) webAPI() *web.API {
 			return d.filex.Mkdir(ctx, peer, path)
 		},
 		Rename: func(ctx context.Context, peerArg, from, to string) error {
+			if peerArg == "" {
+				return d.filex.RenameLocal(from, to)
+			}
 			peer, err := d.resolvePeerArg(peerArg)
 			if err != nil {
 				return err
@@ -465,6 +491,9 @@ func (d *Daemon) webAPI() *web.API {
 			return d.filex.Rename(ctx, peer, from, to)
 		},
 		Remove: func(ctx context.Context, peerArg, path string, recursive bool) error {
+			if peerArg == "" {
+				return d.filex.RemoveLocal(path, recursive)
+			}
 			peer, err := d.resolvePeerArg(peerArg)
 			if err != nil {
 				return err
@@ -567,6 +596,26 @@ func (d *Daemon) webAPI() *web.API {
 			}
 			var cs *term.ClientSession
 			if sessionID != 0 {
+				// Verify the session is still alive before attaching: the
+				// attach itself cannot (a dead session just closes the data
+				// stream silently), and the UI needs a real error to mark the
+				// tab dead instead of looping reconnects against a ghost.
+				lctx, lcancel := context.WithTimeout(context.Background(), 10*time.Second)
+				list, lerr := term.ClientList(lctx, peer)
+				lcancel()
+				if lerr != nil {
+					return nil, 0, nil, lerr
+				}
+				live := false
+				for _, info := range list {
+					if info.Session == sessionID {
+						live = true
+						break
+					}
+				}
+				if !live {
+					return nil, 0, nil, fmt.Errorf("no such session %d", sessionID)
+				}
 				cs, err = term.ClientAttach(peer, sessionID)
 			} else {
 				cs, err = term.ClientStart(context.Background(), peer, cols, rows, "", "")
@@ -591,6 +640,22 @@ func (d *Daemon) webAPI() *web.API {
 			}
 			d.recordActivity("term", peer.ID, fmt.Sprintf("结束终端会话 #%d", session))
 			return nil
+		},
+		TermList: func(peerArg string) (any, error) {
+			id, err := d.lookupPeerArg(peerArg)
+			if err != nil {
+				return nil, err
+			}
+			// Sessions live in the remote daemon's memory, so listing only
+			// makes sense against a connected device; an offline one just has
+			// nothing to restore.
+			peer, ok := d.mgr.Get(id)
+			if !ok {
+				return []term.SessionInfo{}, nil
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return term.ClientList(ctx, peer)
 		},
 		Activity: func(limit int) any {
 			return map[string]any{"items": d.acts.List(limit)}

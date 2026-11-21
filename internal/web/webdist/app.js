@@ -111,6 +111,7 @@ const state = {
   terms: [],             // {id, peer, session, state, term, ws, fit, pane, retries, ...}
   activeTerm: null,
   termSeq: 0,
+  termGone: new Set(),   // "peer:session" the user dismissed; never restored
   activity: [],          // most recent last
 };
 
@@ -230,7 +231,7 @@ function switchPage(name, arg) {
   if (name === "home") refreshStatus();
   if (name === "fwd") refreshFwd();
   if (name === "files") { renderFsPeers(); loadDirWork(state.fs, "local"); loadDirWork(state.fs, "remote"); }
-  if (name === "term") { if (state.activeTerm) activateTerm(state.activeTerm); }
+  if (name === "term") { if (state.activeTerm) activateTerm(state.activeTerm); restoreTerms($("#term-peer").value); }
   if (name === "device") { renderDeviceHead(); setDeviceTab(state.deviceTab); }
 }
 
@@ -462,6 +463,7 @@ function setDeviceTab(tab) {
     const mine = state.terms.filter((t) => t.peer === state.device && t.state !== "dead");
     if (mine.length && !mine.includes(state.activeTerm)) activateTerm(mine[mine.length - 1]);
     renderTermTabs();
+    restoreTerms(state.device);
   }
   if (tab === "files") { loadDirWork(state.dvfs, "local"); loadDirWork(state.dvfs, "remote"); }
   if (tab === "fwd") {
@@ -585,7 +587,7 @@ function termPanesHost() {
   return state.page === "device" && state.deviceTab === "term" ? $("#dv-term-panes") : $("#term-panes");
 }
 
-function openTerm(peerID) {
+function openTerm(peerID, sessionID) {
   if (!peerID) { toast("请先选择设备", true); return; }
   const p = (state.status?.peers || []).find((x) => x.id === peerID);
   if (p && p.status === "offline") { toast("设备离线，请先连接", true); return; }
@@ -609,13 +611,34 @@ function openTerm(peerID) {
 
   const cols = fit.proposeDimensions()?.cols || 80;
   const rows = fit.proposeDimensions()?.rows || 24;
-  const ts = { id, peer: peerID, session: 0, state: "attaching", term, ws: null, fit, pane, name: peerName(peerID), retries: 0, reconnectTm: 0, manualClose: false };
+  // sessionID re-attaches to a PTY that is still alive on the peer (tab
+  // restore after a refresh); 0 opens a fresh session.
+  const ts = { id, peer: peerID, session: sessionID || 0, state: "attaching", term, ws: null, fit, pane, name: peerName(peerID), retries: 0, reconnectTm: 0, manualClose: false };
   pane._ts = ts;
   state.terms.push(ts);
 
   dialTerm(ts, cols, rows);
   renderTermTabs();
   activateTerm(ts);
+}
+
+// restoreTerms brings back tabs for sessions that are still alive on the peer
+// but unknown to this browser (e.g. after a page refresh). Sessions the user
+// dismissed (✕ on a detached tab) are never restored again.
+async function restoreTerms(peerID) {
+  if (!peerID || !peerOnline(peerID)) return;
+  let res;
+  try { res = await api("GET", "/api/term/list?peer=" + encodeURIComponent(peerID)); }
+  catch { return; } // older backend without the endpoint: nothing to restore
+  for (const info of res.sessions || []) {
+    // A session with a live viewer (rt term, another tab) must not be stolen:
+    // attaching replaces the stream and drops the current viewer, so only
+    // orphaned sessions are restored.
+    if (info.attached) continue;
+    if (state.terms.some((t) => t.peer === peerID && t.session === info.session)) continue;
+    if (state.termGone.has(peerID + ":" + info.session)) continue;
+    openTerm(peerID, info.session);
+  }
 }
 
 function dialTerm(ts, cols, rows) {
@@ -635,15 +658,21 @@ function dialTerm(ts, cols, rows) {
   };
   ws.onmessage = (m) => {
     if (typeof m.data === "string") {
-      // session id announcement (JSON)
-      try { const j = JSON.parse(m.data); if (j.session) ts.session = j.session; } catch { /* not json */ }
+      // Control frames (JSON): the session id announcement, or a dial error —
+      // an error marks the tab dead instead of looping reconnects against a
+      // session that no longer exists.
+      try {
+        const j = JSON.parse(m.data);
+        if (j.session) ts.session = j.session;
+        if (j.error) { markTermDead(ts, j.error); return; }
+      } catch { /* not json */ }
       return;
     }
     ts.term.write(new Uint8Array(m.data));
   };
   ws.onclose = () => {
-    // detachTerm/endTermSession already disposed the UI side; nothing to do.
-    if (ts.manualClose || !state.terms.includes(ts)) return;
+    // detachTerm/endTermSession/markTermDead already disposed the UI side.
+    if (ts.manualClose || ts.state === "dead" || !state.terms.includes(ts)) return;
     scheduleTermReconnect(ts);
   };
   // Report PTY resizes back: the server accepts {"cols":N,"rows":N} text
@@ -705,7 +734,8 @@ function wakeOfflineTerms() {
 function markTermDead(ts, why) {
   clearTimeout(ts.reconnectTm);
   ts.state = "dead";
-  ts.term.write(`\r\n\x1b[90m— 会话已结束${why ? "（" + why + "）" : ""} —\x1b[0m\r\n`);
+  // The tab may have been disposed while the error frame was in flight.
+  try { ts.term.write(`\r\n\x1b[90m— 会话已结束${why ? "（" + why + "）" : ""} —\x1b[0m\r\n`); } catch { /* disposed */ }
   renderTermTabs();
   renderStats();
 }
@@ -795,6 +825,9 @@ function removeTermTab(ts) {
   try { ts.term.dispose(); } catch { /* already disposed */ }
   ts.pane.remove();
   state.terms = state.terms.filter((x) => x !== ts);
+  // A dismissed tab whose remote session may still be alive must not pop up
+  // again on the next page visit.
+  if (ts.session) state.termGone.add(ts.peer + ":" + ts.session);
   if (state.activeTerm === ts) {
     state.activeTerm = null;
     const rest = state.terms.filter((t) => t.state !== "dead");
@@ -834,6 +867,12 @@ function makeWork(rootEl, peerFn) {
   return work;
 }
 
+// panePeer is the peer argument for fs operations on one pane: the local pane
+// addresses this daemon (peer ""), not the selected remote peer.
+function panePeer(work, side) {
+  return side === "local" ? "" : work.peerFn();
+}
+
 function bindFilePane(pane, work) {
   const side = pane.dataset.side;
   const st = work[side];
@@ -851,7 +890,7 @@ function bindFilePane(pane, work) {
         const n = prompt("文件夹名");
         if (!n) return;
         try {
-          await api("POST", "/api/fs/mkdir", { peer: work.peerFn(), path: joinPath(st.path, n) });
+          await api("POST", "/api/fs/mkdir", { peer: panePeer(work, side), path: joinPath(st.path, n) });
           loadDirWork(work, side);
         } catch (e) { toast(e.message, true); }
       }
@@ -937,7 +976,7 @@ function renderDir(work, side) {
       const nn = prompt("重命名", en.name);
       if (!nn || nn === en.name) return;
       try {
-        await api("POST", "/api/fs/rename", { peer: work.peerFn(), from: joinPath(st.path, en.name), to: joinPath(st.path, nn) });
+        await api("POST", "/api/fs/rename", { peer: panePeer(work, side), from: joinPath(st.path, en.name), to: joinPath(st.path, nn) });
         loadDirWork(work, side);
       } catch (e) { toast(e.message, true); }
     });
@@ -947,7 +986,7 @@ function renderDir(work, side) {
       const sideName = side === "local" ? "本机" : "远端";
       if (!confirm(`删除 ${sideName} ${en.name}${en.dir ? "（含内容）" : ""}？`)) return;
       try {
-        await api("POST", "/api/fs/remove", { peer: work.peerFn(), path: joinPath(st.path, en.name), recursive: !!en.dir });
+        await api("POST", "/api/fs/remove", { peer: panePeer(work, side), path: joinPath(st.path, en.name), recursive: !!en.dir });
         loadDirWork(work, side);
       } catch (e) { toast(e.message, true); }
     });
@@ -1041,6 +1080,7 @@ function renderXfers() {
       ? fmtSize(p.done) + (p.size ? " / " + fmtSize(p.size) : "") + (p._speed ? " · " + fmtSize(p._speed) + "/s" : "")
       : canceled ? "已取消"
       : p.state === "done" ? "已完成"
+      : p.state === "interrupted" ? "已中断（重试可续传）"
       : p.state + (p.err ? ": " + esc(p.err) : "");
     row.innerHTML = `
       <div class="x-top">

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -51,6 +52,12 @@ func (f *fakePTY) stdinBytes() []byte {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]byte(nil), f.stdin...)
+}
+
+func (f *fakePTY) stopped() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closed
 }
 
 func (f *fakePTY) Read(p []byte) (int, error) {
@@ -229,6 +236,100 @@ func wantQuiet(t *testing.T, st *fakeStream, want []byte) []byte {
 }
 
 // ------------------------------------------------------------------- tests ---
+
+func TestCloseOwnedUniformError(t *testing.T) {
+	s := NewService(testLogger())
+	fp := newFakePTY()
+	swapPTY(t, fp)
+
+	res, err := s.open("devA", openParams{})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// A foreign device and an unknown id must both get the same uniform
+	// "no such session" error the client's ClientCloseByID documents.
+	if err := s.closeOwned("devB", res.Session); err == nil || !strings.Contains(err.Error(), "no such session") {
+		t.Fatalf("foreign close: err=%v, want 'no such session'", err)
+	}
+	if err := s.closeOwned("devA", res.Session+999); err == nil || !strings.Contains(err.Error(), "no such session") {
+		t.Fatalf("unknown close: err=%v, want 'no such session'", err)
+	}
+	if s.getOwned("devA", res.Session) == nil {
+		t.Fatal("failed close attempts must not touch the session")
+	}
+	if err := s.closeOwned("devA", res.Session); err != nil {
+		t.Fatalf("owner close: %v", err)
+	}
+	select {
+	case <-fp.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pty was not killed by the owner's close")
+	}
+}
+
+func TestSessionQuota(t *testing.T) {
+	s := NewService(testLogger())
+	swapPTY(t, newFakePTY())
+
+	// Fill up the owner's quota.
+	for i := 0; i < maxSessionsPerOwner; i++ {
+		if _, err := s.open("devA", openParams{}); err != nil {
+			t.Fatalf("open %d: %v", i, err)
+		}
+	}
+	if _, err := s.open("devA", openParams{}); err == nil || !strings.Contains(err.Error(), "too many sessions") {
+		t.Fatalf("over-quota open: err=%v, want 'too many sessions'", err)
+	}
+	// Another device still fits until the global cap, so the quota is per
+	// owner, not global-first.
+	res, err := s.open("devB", openParams{})
+	if err != nil {
+		t.Fatalf("devB open under devA's quota: %v", err)
+	}
+	if s.getOwned("devB", res.Session) == nil {
+		t.Fatal("devB session not tracked")
+	}
+}
+
+func TestReaperKillsIdleSessions(t *testing.T) {
+	oldInterval, oldTTL := reapInterval, sessionIdleTTL
+	reapInterval, sessionIdleTTL = 20*time.Millisecond, 80*time.Millisecond
+	t.Cleanup(func() { reapInterval, sessionIdleTTL = oldInterval, oldTTL })
+
+	s := NewService(testLogger())
+	fp := newFakePTY()
+	swapPTY(t, fp)
+
+	res, err := s.open("devA", openParams{})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	peer := &session.Peer{ID: "devA"}
+
+	// An attached session must survive the reaper.
+	st := newFakeStream()
+	go s.HandleStream(peer, proto.ChanTerm, &proto.DataHeader{Session: res.Session}, st)
+	waitFor(t, "stream to attach", func() bool {
+		sess := s.getOwned("devA", res.Session)
+		if sess == nil {
+			return false
+		}
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		return sess.stream != nil
+	})
+	time.Sleep(5 * reapInterval)
+	if s.getOwned("devA", res.Session) == nil {
+		t.Fatal("reaper killed a session with an attached stream")
+	}
+
+	// Once detached (nobody came back within the TTL), the reaper reaps it:
+	// kill reaches the pty and the waiter drops the table entry.
+	_ = st.Close()
+	waitFor(t, "reaper to kill the idle session", func() bool {
+		return fp.stopped() && s.getOwned("devA", res.Session) == nil
+	})
+}
 
 func TestSessionOwnership(t *testing.T) {
 	s := NewService(testLogger())

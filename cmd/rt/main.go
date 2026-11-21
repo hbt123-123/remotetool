@@ -507,12 +507,16 @@ func watchProgress(c *client, xferID string) error {
 			fmt.Print(out)
 			last = out
 		}
-		if ev.Data.State == "done" || ev.Data.State == "error" {
+		if ev.Data.State == "done" || ev.Data.State == "error" || ev.Data.State == "interrupted" {
 			fmt.Println()
-			if ev.Data.State == "error" {
-				return fmt.Errorf("%s", ev.Data.Err)
+			if ev.Data.State == "done" {
+				return nil
 			}
-			return nil
+			if ev.Data.State == "interrupted" {
+				// The .rtpart stays on disk, so the next attempt resumes.
+				return fmt.Errorf("transfer interrupted (%s); retrying resumes from the received bytes", ev.Data.Name)
+			}
+			return fmt.Errorf("%s", ev.Data.Err)
 		}
 	}
 	return sc.Err()

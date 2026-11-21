@@ -108,7 +108,9 @@ func TestFinalizeIdempotent(t *testing.T) {
 
 func TestForeignStreamRejected(t *testing.T) {
 	s := NewService(testLogger())
-	s.OnProgress(func(Progress) {})
+	var progMu sync.Mutex
+	var progs []Progress
+	s.OnProgress(func(p Progress) { progMu.Lock(); progs = append(progs, p); progMu.Unlock() })
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "a.bin")
@@ -128,7 +130,9 @@ func TestForeignStreamRejected(t *testing.T) {
 	}
 
 	// The owning peer can still stream bytes; with sizeKnown=false the EOF
-	// path reports "interrupted" and keeps the transfer registered.
+	// path reports "interrupted": the receive entry is dropped (no leaked
+	// handle, a waiting PullFile unblocks) but the part file is kept so a
+	// retry resumes from this offset.
 	own := newStubStream([]byte("hello"))
 	own.Close()
 	s.HandleStream(&session.Peer{ID: "devA"}, proto.ChanFile, &proto.DataHeader{XferID: "x2"}, own)
@@ -143,16 +147,15 @@ func TestForeignStreamRejected(t *testing.T) {
 	s.mu.Lock()
 	rs := s.recv["x2"]
 	s.mu.Unlock()
-	if rs == nil {
-		t.Fatal("receive state vanished")
+	if rs != nil {
+		t.Fatal("receive state was kept after the interrupted stream")
 	}
-	rs.muSt.Lock()
-	offset := rs.offset
-	rs.muSt.Unlock()
-	if offset != int64(len("hello")) {
-		t.Fatalf("rs.offset = %d, want %d", offset, len("hello"))
+	progMu.Lock()
+	last := progs[len(progs)-1]
+	progMu.Unlock()
+	if last.State != "interrupted" {
+		t.Fatalf("terminal progress state = %q, want interrupted", last.State)
 	}
-	s.cancel("x2") // release the part file so TempDir cleanup works on Windows
 }
 
 func TestUnknownXferIDRejected(t *testing.T) {

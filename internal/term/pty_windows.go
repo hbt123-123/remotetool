@@ -33,7 +33,50 @@ var (
 	procInitAttrList        = modkernel32.NewProc("InitializeProcThreadAttributeList")
 	procUpdateAttr          = modkernel32.NewProc("UpdateProcThreadAttribute")
 	procDeleteAttrList      = modkernel32.NewProc("DeleteProcThreadAttributeList")
+	procCreateJobObject     = modkernel32.NewProc("CreateJobObjectW")
+	procSetJobInfo          = modkernel32.NewProc("SetInformationJobObject")
+	procAssignToJob         = modkernel32.NewProc("AssignProcessToJobObject")
+	procTerminateJob        = modkernel32.NewProc("TerminateJobObject")
 )
+
+// Job-object plumbing for killing the whole shell tree: a ConPTY session must
+// not leak grandchildren when the shell or the daemon goes away. Local copies
+// of the Win32 limit structs (field order matches winnt.h; Go's natural
+// alignment reproduces the C padding on 64-bit platforms).
+const (
+	jobObjectExtendedLimitInfo = 9      // JobObjectExtendedLimitInformation
+	jobLimitKillOnJobClose     = 0x2000 // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+)
+
+type jobBasicLimitInfo struct {
+	PerProcessUserTimeLimit int64
+	PerJobUserTimeLimit     int64
+	LimitFlags              uint32
+	MinimumWorkingSetSize   uintptr
+	MaximumWorkingSetSize   uintptr
+	ActiveProcessLimit      uint32
+	Affinity                uintptr
+	PriorityClass           uint32
+	SchedulingClass         uint32
+}
+
+type jobIOCounters struct {
+	ReadOperationCount  uint64
+	WriteOperationCount uint64
+	OtherOperationCount uint64
+	ReadTransferCount   uint64
+	WriteTransferCount  uint64
+	OtherTransferCount  uint64
+}
+
+type jobExtendedLimitInfo struct {
+	BasicLimitInformation jobBasicLimitInfo
+	IoInfo                jobIOCounters
+	ProcessMemoryLimit    uintptr
+	JobMemoryLimit        uintptr
+	PeakProcessMemoryUsed uintptr
+	PeakJobMemoryUsed     uintptr
+}
 
 func conptyAvailable() bool { return procCreatePseudoConsole.Find() == nil }
 
@@ -94,11 +137,11 @@ type conPTY struct {
 	outR *os.File
 	hpc  windows.Handle
 	hPrc windows.Handle
+	hJob windows.Handle // tree-kill handle; 0 when the job could not be created
 
-	mu      sync.Mutex
-	once    sync.Once
-	code    int
-	waiting bool
+	mu     sync.Mutex
+	code   int
+	exited bool // Wait ran and tore the handles down; Kill/Resize are no-ops
 }
 
 func startConPTY(cols, rows uint16, shell, cwd string) (PTY, error) {
@@ -192,7 +235,18 @@ func startConPTY(cols, rows uint16, shell, cwd string) (PTY, error) {
 		return nil, fmt.Errorf("CreateProcess %s: %w", shell, err)
 	}
 	_ = windows.CloseHandle(pi.Thread)
-	return &conPTY{inW: inW, outR: outR, hpc: hpc, hPrc: pi.Process}, nil
+	// Put the shell into a kill-on-close job so its children die with it;
+	// without the job, Kill can only terminate the shell itself. Best
+	// effort: job creation failing must not fail the whole PTY.
+	hJob, _, _ := procCreateJobObject.Call(0, 0)
+	if hJob != 0 {
+		var info jobExtendedLimitInfo
+		info.BasicLimitInformation.LimitFlags = jobLimitKillOnJobClose
+		_, _, _ = procSetJobInfo.Call(hJob, jobObjectExtendedLimitInfo,
+			uintptr(unsafe.Pointer(&info)), unsafe.Sizeof(info))
+		_, _, _ = procAssignToJob.Call(hJob, uintptr(pi.Process))
+	}
+	return &conPTY{inW: inW, outR: outR, hpc: hpc, hPrc: pi.Process, hJob: windows.Handle(hJob)}, nil
 }
 
 func (c *conPTY) Read(p []byte) (int, error)  { return c.outR.Read(p) }
@@ -201,6 +255,11 @@ func (c *conPTY) Write(p []byte) (int, error) { return c.inW.Write(p) }
 func (c *conPTY) Resize(cols, rows uint16) error {
 	if cols == 0 || rows == 0 {
 		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.exited {
+		return nil // console already torn down by Wait
 	}
 	size := coord{X: int16(cols), Y: int16(rows)}
 	r1, _, err := procResizePseudoConsole.Call(
@@ -214,29 +273,45 @@ func (c *conPTY) Resize(cols, rows uint16) error {
 }
 
 func (c *conPTY) Kill() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.exited {
+		return nil // Wait already closed the handles
+	}
+	// Kill the whole job (shell + children); without a job fall back to
+	// terminating the shell process itself.
+	if c.hJob != 0 {
+		_, _, _ = procTerminateJob.Call(uintptr(c.hJob), 1)
+	}
 	_ = windows.TerminateProcess(c.hPrc, 1)
 	return nil
 }
 
 func (c *conPTY) Wait() (int, error) {
-	c.mu.Lock()
-	c.waiting = true
-	c.mu.Unlock()
 	ev, err := windows.WaitForSingleObject(c.hPrc, windows.INFINITE)
 	if err != nil && ev != windows.WAIT_OBJECT_0 {
 		return -1, err
 	}
 	var code uint32
 	_ = windows.GetExitCodeProcess(c.hPrc, &code)
-	// Only now is it safe to tear down the pseudoconsole.
-	_, _, _ = procClosePseudoConsole.Call(uintptr(c.hpc))
-	_ = windows.CloseHandle(c.hPrc)
 	c.mu.Lock()
-	c.code = int(int32(code))
-	c.once.Do(func() {})
-	c.mu.Unlock()
-	_ = c.inW.Close()
-	_ = c.outR.Close()
+	defer c.mu.Unlock()
+	if !c.exited {
+		c.code = int(int32(code))
+		c.exited = true
+		// Only now is it safe to tear down the pseudoconsole.
+		_, _, _ = procClosePseudoConsole.Call(uintptr(c.hpc))
+		_ = windows.CloseHandle(c.hPrc)
+		c.hPrc = 0
+		// Closing the job handle reaps orphaned children via
+		// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+		if c.hJob != 0 {
+			_ = windows.CloseHandle(c.hJob)
+			c.hJob = 0
+		}
+		_ = c.inW.Close()
+		_ = c.outR.Close()
+	}
 	return c.code, nil
 }
 

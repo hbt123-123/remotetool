@@ -80,7 +80,7 @@
 | 身份认证 | QUIC TLS 层证书钉扎（`dialer.pinVerify`）；通道绑定 `transport.CertBinding` 只用于配对 |
 | 会话创建 | `internal/session/handshake.go`：hello 元数据交换 + `register`（glare 处理、feature 挂载） |
 | 使用 | Feature（term/filex/fwd）经 `AttachRPC/HandleStream` 完全复用 session 层，无自建连接 |
-| 断开 | `rc.Done()` 回调：conns 清理 + `peer_down`（term/filex 的会话/续传刻意跨连接存活） |
+| 断开 | `rc.Done()` 回调：conns 清理 + `peer_down`（term/filex 的会话/续传刻意跨连接存活；term 会话由服务端 reaper 按空闲 TTL 回收） |
 
 对外 API：`Manager.StatusOf`（connected/connecting，空=交聚合层，deviceViews 的唯一运行态证据入口）、
 SSE 事件 `peer_connecting` / `peer_up`（富 payload：name/platform/version/caps/addr/via）/ `peer_down`。

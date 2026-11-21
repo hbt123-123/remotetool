@@ -67,6 +67,18 @@
   服务端持续把输出写入 256KB 环形缓冲，重连/刷新页面时重新挂接 `ChanTerm`
   数据流即先回放缓冲再衔接新输出——不存在 `term.attach` RPC，重挂就是数据
   流本身（客户端封装为 `ClientAttach`）。
+- **会话 id 通告与恢复**：拨号成功后服务端以 `{"session":N}` 文本帧下发会话
+  id，客户端重连时带 `?session=N` 重挂同一 PTY；挂接前 daemon 经 `term.list`
+  校验会话仍在，已结束的会话返回统一错误（UI 据此标记会话结束而非循环重连）。
+  `GET /api/term/list` 列出对端上本设备的活跃会话，UI 刷新后据此恢复标签页。
+- **会话配额与回收**：每设备 16 个、全局 32 个会话上限（超限统一报错）；
+  服务端 reaper 回收长时间（30 分钟）无人挂接的会话——`peer_down` 仍不清
+  会话，reaper 是唯一的主动清理路径。
+- **进程树清理**：Unix 以会话为单位 SIGKILL（creack/pty 以 `Setsid` 启动
+  shell，job-control shell 给每个 job 独立进程组，杀单组不够；Linux 扫
+  `/proc` 按会话 id 枚举，其他 unix 回退杀首进程组），`Wait` 后关闭 pty
+  master fd，防止孙进程持有 slave 造成的 fd/goroutine 泄漏；Windows 用
+  kill-on-close Job Object 树杀，`Wait/Kill/Resize` 以互斥锁保护句柄生命周期。
 - **归属隔离**：会话属于 `term.open` 的调用设备；`term.resize/close/list` 与
   数据流挂接只作用于自己的会话，他人会话一律按“不存在”处理（不泄露存在性）。
 - 前端 xterm.js（vendor 本地化，无 CDN）；CLI `rt term` 原始模式
@@ -84,6 +96,12 @@
 4. **complete**：`xfer.complete {id, sha256}`，接收端等齐 EOF 与校验和
    （两事件无顺序保证，用 ready 通道合并），校验通过原子改名落盘；
    不完整时保留 `.rtpart` 供续传，校验失败/取消时删除。
+5. **失败清理**：发送端早期失败（本地文件打不开、数据流建立失败）会向对端
+   发送 `xfer.cancel`（5s 上限）回收接收状态；接收端中断（EOF 早于 size）
+   释放接收条目并保留 `.rtpart`，事件为 `interrupted` 状态（CLI 视为终态
+   退出，重试自动续传）。两侧取消事件的 `Err` 统一为 `"canceled"`。
+   Web UI 的“本机”面板以空 `peer` 走本地 fs 处理器（`peer == ""` 不参与
+   设备解析，杜绝空前缀命中第一个配对设备的误路由）。
 
 fs 浏览操作：`fs.list/mkdir/rename/remove/stat`（`fs.list` 空路径在 Windows
 返回盘符列表）。目录推送：`filepath.WalkDir` 逐文件 push。进度经事件总线

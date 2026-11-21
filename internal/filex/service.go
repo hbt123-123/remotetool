@@ -305,6 +305,28 @@ func removePath(path string, recursive bool) error {
 	return os.Remove(path)
 }
 
+// ------------------------------------------------------------- local ops ---
+
+// Local-mode variants behind the web UI's "this device" pane: they run the
+// same filesystem handlers as the RPC surface, just without the wire.
+
+// ListLocal lists a directory on this device.
+func (s *Service) ListLocal(path string) (*listResult, error) { return s.listDir(path) }
+
+// MkdirLocal creates a directory on this device.
+func (s *Service) MkdirLocal(path string) error {
+	if path == "" {
+		return errors.New("path required")
+	}
+	return os.MkdirAll(path, 0o755)
+}
+
+// RenameLocal renames a path on this device.
+func (s *Service) RenameLocal(from, to string) error { return os.Rename(from, to) }
+
+// RemoveLocal removes a path on this device.
+func (s *Service) RemoveLocal(path string, recursive bool) error { return removePath(path, recursive) }
+
 // recvState tracks one inbound transfer on this device.
 type recvState struct {
 	id        string
@@ -448,7 +470,14 @@ func (s *Service) HandleStream(peer *session.Peer, _ proto.Chan, h *proto.DataHe
 					s.failRecv(rs.id, ferr.Error())
 				}
 			} else {
-				s.progress(Progress{ID: rs.id, PeerID: peer.ID, Direction: "pull", LocalPath: rs.finalPath, Name: filepath.Base(rs.finalPath), Size: rs.size, Done: rs.offset, State: "interrupted"})
+				// Incomplete stream: forget the entry but KEEP the part
+				// file so the next attempt resumes from this offset.
+				// Finishing also unblocks a waiting PullFile — the entry
+				// used to linger with an open file handle and the pull
+				// hung until its 24h context timeout.
+				_ = rs.f.Close()
+				s.dropRecv(rs.id)
+				s.finishInterrupted(rs)
 			}
 			return
 		}
@@ -520,6 +549,18 @@ func (s *Service) finish(rs *recvState, err error) {
 	})
 }
 
+// finishInterrupted records an interrupted inbound transfer: the part file
+// stays on disk for resume, the recv entry is dropped and a waiting PullFile
+// unblocks. The Progress keeps the dedicated "interrupted" state so the
+// activity feed renders it as 中断 (not 失败) and the CLI exits cleanly.
+func (s *Service) finishInterrupted(rs *recvState) {
+	rs.finOnce.Do(func() {
+		rs.finErr = errors.New("interrupted")
+		close(rs.finDone)
+		s.progress(Progress{ID: rs.id, PeerID: rs.peerID, Direction: "pull", LocalPath: rs.finalPath, Name: filepath.Base(rs.finalPath), Size: rs.size, Done: rs.offset, State: "interrupted"})
+	})
+}
+
 func (s *Service) failRecv(id, msg string) {
 	s.mu.Lock()
 	rs := s.recv[id]
@@ -563,6 +604,16 @@ func (s *Service) dropRecv(id string) {
 	s.mu.Lock()
 	delete(s.recv, id)
 	s.mu.Unlock()
+}
+
+// notifyCancel asks the peer to drop its receive state for id (best effort):
+// a sender-side failure is otherwise invisible to the receiver, whose entry
+// and open part-file handle would linger until daemon exit. Bounded so a
+// wedged peer cannot stall the failure path for an idle timeout.
+func notifyCancel(peer *session.Peer, id string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = peer.RPC(ctx, "xfer.cancel", cancelParams{ID: id}, nil)
 }
 
 func uniquePath(p string) string {
@@ -639,8 +690,12 @@ func (s *Service) pushOne(ctx context.Context, peer *session.Peer, localPath, re
 	if err := peer.RPC(ctx, "xfer.push", pushParams{ID: id, Path: remotePath, Size: size, Conflict: conflict}, &res); err != nil {
 		return id, fmt.Errorf("peer rejected %s: %w", name, err)
 	}
+	// From here on the receiver tracks this transfer: every sender-side
+	// failure must tell it to clean up, or its recv entry and part file
+	// linger until daemon exit.
 	f, err := os.Open(localPath)
 	if err != nil {
+		notifyCancel(peer, id)
 		return id, err
 	}
 	defer f.Close()
@@ -649,11 +704,13 @@ func (s *Service) pushOne(ctx context.Context, peer *session.Peer, localPath, re
 	hash := sha256.New()
 	if res.Offset > 0 {
 		if _, err := io.CopyN(hash, f, res.Offset); err != nil {
+			notifyCancel(peer, id)
 			return id, err
 		}
 	}
 	st, err := peer.OpenData(proto.ChanFile, &proto.DataHeader{XferID: id})
 	if err != nil {
+		notifyCancel(peer, id)
 		return id, err
 	}
 	defer st.Close()
@@ -677,8 +734,10 @@ func (s *Service) pushOne(ctx context.Context, peer *session.Peer, localPath, re
 		// transfer via /api/xfer/cancel (the ctx is the handler's).
 		select {
 		case <-ctx.Done():
-			report("error", ctx.Err().Error())
-			_ = peer.RPC(context.Background(), "xfer.cancel", cancelParams{ID: id}, nil)
+			// The same string the receiver-side cancel reports, so the
+			// activity log's canceled classification matches both directions.
+			report("error", "canceled")
+			notifyCancel(peer, id)
 			return id, ctx.Err()
 		default:
 		}
@@ -686,7 +745,7 @@ func (s *Service) pushOne(ctx context.Context, peer *session.Peer, localPath, re
 		if n > 0 {
 			if _, werr := st.Write(buf[:n]); werr != nil {
 				report("error", werr.Error())
-				_ = peer.RPC(context.Background(), "xfer.cancel", cancelParams{ID: id}, nil)
+				notifyCancel(peer, id)
 				return id, fmt.Errorf("send %s: %w", name, werr)
 			}
 			hash.Write(buf[:n])
@@ -782,6 +841,7 @@ func (s *Service) sendStream(peer *session.Peer, id, srcPath string, size, offse
 	f, err := os.Open(srcPath)
 	if err != nil {
 		s.log.Warn("xfer.pull open failed", "path", srcPath, "err", err)
+		notifyCancel(peer, id) // unblock the requester's waiting PullFile
 		return
 	}
 	defer f.Close()
@@ -791,12 +851,14 @@ func (s *Service) sendStream(peer *session.Peer, id, srcPath string, size, offse
 		// skip sending it.
 		if _, err := io.CopyN(hash, f, offset); err != nil {
 			s.log.Warn("xfer.pull prefix read failed", "err", err)
+			notifyCancel(peer, id)
 			return
 		}
 	}
 	st, err := peer.OpenData(proto.ChanFile, &proto.DataHeader{XferID: id})
 	if err != nil {
 		s.log.Warn("xfer.pull open stream failed", "err", err)
+		notifyCancel(peer, id)
 		return
 	}
 	defer st.Close()

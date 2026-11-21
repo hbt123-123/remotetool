@@ -18,6 +18,21 @@ import (
 // re-attaching client sees what it missed (tmux-lite behaviour).
 const scrollback = 256 << 10
 
+// Session quotas: each session costs a shell process plus ring and pump
+// goroutines, so one device cannot fill the table and starve the daemon.
+const (
+	maxSessionsPerOwner = 16
+	maxSessionsTotal    = 32
+)
+
+// Reaping knobs: a detached session deliberately survives peer reconnects
+// (see AttachRPC), so the reaper — not peer_down — is the cleanup path for
+// sessions nobody comes back to. Vars so tests can shorten them.
+var (
+	reapInterval   = time.Minute
+	sessionIdleTTL = 30 * time.Minute
+)
+
 // Service is the terminal server feature: it hosts PTY sessions.
 type Service struct {
 	log *slog.Logger
@@ -27,9 +42,11 @@ type Service struct {
 	sessions map[uint64]*Session
 }
 
-// NewService builds the terminal feature.
+// NewService builds the terminal feature and starts the idle-session reaper.
 func NewService(log *slog.Logger) *Service {
-	return &Service{log: log, sessions: map[uint64]*Session{}}
+	s := &Service{log: log, sessions: map[uint64]*Session{}}
+	go s.reapLoop()
+	return s
 }
 
 type openParams struct {
@@ -49,11 +66,13 @@ type sessionIDParams struct {
 	Rows    uint16 `json:"rows,omitempty"`
 }
 
-type sessionInfo struct {
-	Session uint64 `json:"session"`
-	Cols    uint16 `json:"cols"`
-	Rows    uint16 `json:"rows"`
-	Alive   bool   `json:"alive"`
+// SessionInfo describes one owned session for term.list: the web UI uses it
+// to restore tabs after a refresh and to tell live sessions from stale ones.
+type SessionInfo struct {
+	Session  uint64 `json:"session"`
+	Cols     uint16 `json:"cols"`
+	Rows     uint16 `json:"rows"`
+	Attached bool   `json:"attached"` // a client stream is attached right now
 }
 
 // Session is one live PTY owned by the server.
@@ -67,6 +86,7 @@ type Session struct {
 
 	mu       sync.Mutex
 	stream   transport.Stream // attached client stream, may be nil
+	idleAt   time.Time        // last moment with no attached stream (reaper)
 	ring     []byte
 	ringBase int           // absolute offset of ring[0] in the pty output
 	outCur   int           // absolute offset already sent to the attachment
@@ -110,12 +130,7 @@ func (s *Service) AttachRPC(peer *session.Peer, rc *proto.RPCConn) {
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
 		}
-		sess := s.getOwned(owner, p.Session)
-		if sess == nil {
-			return nil, nil
-		}
-		_ = sess.pty.Kill()
-		return nil, nil
+		return nil, s.closeOwned(owner, p.Session)
 	})
 	rc.Handle("term.list", func(params json.RawMessage) (any, error) {
 		return s.list(owner), nil
@@ -129,6 +144,20 @@ func (s *Service) open(owner string, p openParams) (*openResult, error) {
 	if p.Rows == 0 {
 		p.Rows = 24
 	}
+	// Quota check before starting any PTY, so a rejected open costs nothing.
+	s.mu.Lock()
+	total, mine := 0, 0
+	for _, sess := range s.sessions {
+		total++
+		if sess.owner == owner {
+			mine++
+		}
+	}
+	if mine >= maxSessionsPerOwner || total >= maxSessionsTotal {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("too many sessions (max %d per device, %d total)", maxSessionsPerOwner, maxSessionsTotal)
+	}
+	s.mu.Unlock()
 	pty, err := startPTY(p.Cols, p.Rows, p.Shell, p.Cwd)
 	if err != nil {
 		return nil, err
@@ -144,12 +173,20 @@ func (s *Service) open(owner string, p openParams) (*openResult, error) {
 		ring:   make([]byte, 0, scrollback),
 		notify: make(chan struct{}, 1),
 		done:   make(chan struct{}),
+		idleAt: time.Now(),
 	}
 	s.sessions[sess.ID] = sess
 	s.mu.Unlock()
 	go s.readLoop(sess)
 	go s.pump(sess)
 	go func() {
+		// Long-lived per-session goroutine: log and die instead of taking the
+		// whole daemon down.
+		defer func() {
+			if r := recover(); r != nil {
+				s.log.Error("term goroutine panic", "panic", r)
+			}
+		}()
 		code, _ := pty.Wait()
 		sess.mu.Lock()
 		sess.exitCode = int32(code)
@@ -173,6 +210,17 @@ func (s *Service) get(id uint64) *Session {
 	return s.sessions[id]
 }
 
+// closeOwned kills the session if it exists and belongs to owner. Unknown
+// ids and foreign sessions get the same uniform error (see getOwned) — the
+// caller cannot distinguish them, matching term.resize.
+func (s *Service) closeOwned(owner string, id uint64) error {
+	sess := s.getOwned(owner, id)
+	if sess == nil {
+		return fmt.Errorf("no such session %d", id)
+	}
+	return sess.pty.Kill()
+}
+
 // getOwned returns the session only if it exists and belongs to owner, so a
 // foreign device cannot reach another device's sessions.
 func (s *Service) getOwned(owner string, id uint64) *Session {
@@ -185,19 +233,19 @@ func (s *Service) getOwned(owner string, id uint64) *Session {
 	return sess
 }
 
-func (s *Service) list(owner string) []sessionInfo {
+func (s *Service) list(owner string) []SessionInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]sessionInfo, 0, len(s.sessions))
+	out := make([]SessionInfo, 0, len(s.sessions))
 	for _, sess := range s.sessions {
 		if sess.owner != owner {
 			continue
 		}
 		sess.mu.Lock()
-		code := sess.exitCode
+		attached := sess.stream != nil
 		c, r := sess.cols, sess.rows
 		sess.mu.Unlock()
-		out = append(out, sessionInfo{Session: sess.ID, Cols: c, Rows: r, Alive: code == 0})
+		out = append(out, SessionInfo{Session: sess.ID, Cols: c, Rows: r, Attached: attached})
 	}
 	return out
 }
@@ -213,6 +261,44 @@ func (s *Service) Shutdown() {
 	}
 	s.mu.Unlock()
 	for _, sess := range sessions {
+		_ = sess.pty.Kill()
+	}
+}
+
+// reapLoop periodically reaps sessions nobody has attached to for
+// sessionIdleTTL. Each pass recovers on its own so one bad sweep cannot take
+// the reaper down for the daemon's lifetime.
+func (s *Service) reapLoop() {
+	ticker := time.NewTicker(reapInterval)
+	for range ticker.C {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					s.log.Error("term reaper panic", "panic", r)
+				}
+			}()
+			s.reap()
+		}()
+	}
+}
+
+// reap kills the stale sessions; their waiter goroutines do the table
+// cleanup, exactly as in Shutdown.
+func (s *Service) reap() {
+	cutoff := time.Now().Add(-sessionIdleTTL)
+	s.mu.Lock()
+	var stale []*Session
+	for _, sess := range s.sessions {
+		sess.mu.Lock()
+		detached := sess.stream == nil && sess.idleAt.Before(cutoff)
+		sess.mu.Unlock()
+		if detached {
+			stale = append(stale, sess)
+		}
+	}
+	s.mu.Unlock()
+	for _, sess := range stale {
+		s.log.Info("reaping idle terminal session", "session", sess.ID)
 		_ = sess.pty.Kill()
 	}
 }
@@ -290,6 +376,7 @@ func (s *Service) pump(sess *Session) {
 			sess.mu.Lock()
 			if sess.stream == st {
 				sess.stream = nil
+				sess.idleAt = time.Now() // restart the reaper's idle clock
 			}
 			sess.mu.Unlock()
 			_ = st.Close()
@@ -311,6 +398,7 @@ func (s *Service) detach(sess *Session, st transport.Stream) {
 	sess.mu.Lock()
 	if sess.stream == st {
 		sess.stream = nil
+		sess.idleAt = time.Now() // restart the reaper's idle clock
 	}
 	sess.mu.Unlock()
 	_ = st.Close()
@@ -388,6 +476,17 @@ func ClientAttach(peer *session.Peer, sessionID uint64) (*ClientSession, error) 
 		return nil, err
 	}
 	return &ClientSession{Peer: peer, ID: sessionID, Stream: st}, nil
+}
+
+// ClientList lists the sessions this device owns on the peer. The web layer
+// uses it to restore terminal tabs after a page refresh and to fail a stale
+// attach with a clear error instead of a silent EOF.
+func ClientList(ctx context.Context, peer *session.Peer) ([]SessionInfo, error) {
+	var out []SessionInfo
+	if err := peer.RPC(ctx, "term.list", nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ClientCloseByID terminates a remote session by id without attaching to it
