@@ -11,7 +11,7 @@
 ## 环境准备（每个组合做一次）
 
 1. 主控与对端分别安装对应架构的 `rtd`/`rt`，各自启动：
-   `rtd --name <设备名>`（Android 见 [android.md](android.md)）。
+   `rtd --name <设备名>`（Android 见 [android-setup.md](android-setup.md)）。
 2. 对端 Web UI 生成配对码 → 主控 `rt pair <对端IP>:27183 <码>` 完成配对。
 3. 记录双方设备 ID（`rt status`）。
 
@@ -71,11 +71,11 @@ Android 端定位为主控端（连接管理、终端、文件）。除上述步
 - **后台回收**：主控退到后台 10 分钟再回来，Web UI 重开后设备状态应
   正确刷新；对端仍在线。
 - **对端为 Android 的注意项**：mDNS 在 Android 省电模式下不可靠，配对建议
-  直接用 IP；详见 [android.md](android.md)。
+  直接用 IP；详见 [android-setup.md](android-setup.md)。
 
 ### 7 三端经 Hub
 
-1. VPS 上 `hub --listen :27190 --token <token>`（部署见 deploy-hub.md）。
+1. VPS 上 `hub --listen :27190 --token <token>`（部署见 [hub-deployment.md](hub-deployment.md)）。
 2. 三台设备的 Web UI 设置页都填 hub 地址与 token。
 3. 断开设备间直连的可行性（如手机关 Wi-Fi），验证 `connected` 标签为「中继」。
 4. 中继路径下跑一轮：终端 echo、10MB 文件传输、-L 转发 curl。

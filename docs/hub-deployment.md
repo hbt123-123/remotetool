@@ -6,7 +6,11 @@ hub 是 RT 远程的可选自建组件：设备不在同一局域网时提供地
 
 ## 1. 服务端（VPS）
 
-上传 `dist/release/linux-amd64/hub`（在项目根 `./build.sh release` 产出）后：
+获取 `hub` 二进制：从
+[Releases](https://github.com/hbt123-123/remotetool/releases) 下载
+`remotetool-<版本>-linux-amd64.zip` 解压取 `hub`（校验
+`sha256sum -c SHA256SUMS`），或自编译（`./build.sh release`）。上传到
+VPS（如 `/opt/remotetool/hub`）后：
 
 ```bash
 # 生成一个长随机 token
@@ -53,7 +57,15 @@ sudo systemctl enable --now rtd-hub
 
 ## 4. 常见问题
 
-- **连不上 hub**：检查 UDP 27190 放行；确认 token 一致；`--v` 看 hub 日志。
+- **连不上 hub**：检查 UDP 27190 放行；确认 token 一致；`-v` 看 hub 日志
+  （更多排错见 [troubleshooting.md](troubleshooting.md)）。
 - **hub 上线但仍是中继**：对称 NAT 或防火墙阻断了直连，中继即预期行为，
   速度取决于 VPS 带宽。
-- **安全**：务必设置强 token；hub 不需要 root（监听 >1024 端口）。
+- **安全**：务必设置强 token；hub 不需要 root（监听 >1024 端口）；
+  中继只见密文的原理见 [security.md](security.md#传输加密)。
+
+## 5. 经 hub 完成配对
+
+两端都配好本 hub 后，跨公网配对流程与局域网完全一致：
+一方生成配对码、另一方输入地址 + 配对码（hub 会提供地址解析）。
+语义与失败排查见 [pairing-guide.md](pairing-guide.md)。

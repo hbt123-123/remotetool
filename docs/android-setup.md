@@ -1,20 +1,31 @@
 # Android（Termux）运行指南
 
-`dist/release/android-arm64/` 内是 Termux 可用二进制（GOOS=android，PIE，
-`CGO_ENABLED=0` 纯 Go）。**编译冒烟 ≠ 适配完成**：Android 的后台限制、
-网络切换和进程生命周期都需要按本文档配置并真机验证
+Android 端以 **Termux 运行原生二进制**的方式使用（GOOS=android、PIE、
+`CGO_ENABLED=0` 纯 Go；内嵌 Web UI 的薄壳 APK 在路线图中）。
+**编译冒烟 ≠ 适配完成**：Android 的后台限制、网络切换和进程生命周期
+都需要按本文档配置并真机验证
 （验收清单见 [platform-matrix.md](platform-matrix.md) 的 5-6 号组合）。
 
 ## 安装与启动
 
 ```bash
 # 1. 安装 Termux（F-Droid 版本；Play 商店版已过时）
-# 2. 传输二进制（或 termux 直接 wget/curl）
-mkdir -p ~/bin && cp rtd rt ~/bin/ && chmod +x ~/bin/rtd ~/bin/rt
+
+# 2. 下载并安装二进制（或从电脑传 dist/release/android-arm64/ 里的文件）
+pkg install -y unzip
+curl -LO https://github.com/hbt123-123/remotetool/releases/download/v0.1.0/remotetool-v0.1.0-android-arm64.zip
+unzip remotetool-*-android-arm64.zip
+mkdir -p ~/bin && cp remotetool-*/rtd remotetool-*/rt ~/bin/ && chmod +x ~/bin/rtd ~/bin/rt
 
 # 3. 启动守护进程（显式 --home，别让它落在 app 私有目录里）
 rtd --home ~/remotetool --name 我的手机
 ```
+
+> 下载链接以 [Releases](https://github.com/hbt123-123/remotetool/releases)
+> 页面实际版本为准（tag 名与文件名都带 `v` 前缀）。
+
+Web UI 同样可用：手机浏览器打开 `http://127.0.0.1:27180/?t=<token>`
+（token 是启动输出里那串），功能与桌面端一致。
 
 数据目录：`~/remotetool/`（identity.key、config.json、peers.json、rtd.log）。
 Android 没有 mDNS 广播 guarantee，配对时直接用电脑的 IP + 端口。
