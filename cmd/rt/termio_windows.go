@@ -5,7 +5,6 @@ package main
 import (
 	"time"
 
-	"golang.org/x/net/websocket"
 	"golang.org/x/sys/windows"
 )
 
@@ -31,8 +30,9 @@ func winConsoleSize() (uint16, uint16) {
 	return w, ht
 }
 
-// watchResize polls the console size (no SIGWINCH on Windows).
-func watchResize(ws *websocket.Conn) {
+// watchResize polls the console size (no SIGWINCH on Windows) and queues
+// resize frames on the single-writer channel.
+func watchResize(writeCh chan<- wsWrite) {
 	lastC, lastR := winConsoleSize()
 	go func() {
 		for {
@@ -40,7 +40,7 @@ func watchResize(ws *websocket.Conn) {
 			c, r := winConsoleSize()
 			if c > 0 && r > 0 && (c != lastC || r != lastR) {
 				lastC, lastR = c, r
-				sendResize(ws, c, r)
+				sendResize(writeCh, c, r)
 			}
 		}
 	}()

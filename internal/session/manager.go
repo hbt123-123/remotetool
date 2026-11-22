@@ -124,9 +124,18 @@ type Manager struct {
 	// (re-pairing). Called before Serve on both paths.
 	pairAttach func(conn transport.Conn, rc *proto.RPCConn)
 
+	// acceptSem bounds concurrent inbound (paired) handshakes: a handshake
+	// blocks up to helloTimeout waiting for the peer's hello, and one
+	// stalled connection must not queue every other inbound peer behind it.
+	acceptSem chan struct{}
+
 	// hub is the optional self-hosted rendezvous/relay client.
 	hub *HubClient
 }
+
+// maxAcceptHandshakes caps concurrently running inbound handshakes; excess
+// connections are rejected outright (the dialer retries with backoff).
+const maxAcceptHandshakes = 16
 
 // SetHub wires the hub client (optional; enables WAN reachability).
 func (m *Manager) SetHub(h *HubClient) {
@@ -157,13 +166,14 @@ type dialCall struct {
 
 func NewManager(id *identity.Identity, store *config.Store, log *slog.Logger, self device.Meta) *Manager {
 	return &Manager{
-		id:      id,
-		store:   store,
-		log:     log,
-		self:    self,
-		conns:   map[string]*Peer{},
-		cand:    map[string]map[string]bool{},
-		dialing: map[string]*dialCall{},
+		id:        id,
+		store:     store,
+		log:       log,
+		self:      self,
+		conns:     map[string]*Peer{},
+		cand:      map[string]map[string]bool{},
+		dialing:   map[string]*dialCall{},
+		acceptSem: make(chan struct{}, maxAcceptHandshakes),
 	}
 }
 
@@ -290,10 +300,24 @@ func (m *Manager) ServeListener(l transport.Listener) {
 			go fn(conn)
 			continue
 		}
-		if _, err := m.acceptHandshake(conn, conn.RemoteAddr().String()); err != nil {
-			m.log.Warn("inbound handshake failed", "id", conn.RemoteID(), "err", err)
+		// Run the handshake off the accept loop (bounded): it blocks up to
+		// helloTimeout waiting for the peer's hello, and one stalled or
+		// malicious paired device must not queue every other inbound peer
+		// behind it.
+		select {
+		case m.acceptSem <- struct{}{}:
+		default:
+			m.log.Warn("too many concurrent inbound handshakes; rejecting", "id", conn.RemoteID())
 			_ = conn.Close()
+			continue
 		}
+		go func() {
+			defer func() { <-m.acceptSem }()
+			if _, err := m.acceptHandshake(conn, conn.RemoteAddr().String()); err != nil {
+				m.log.Warn("inbound handshake failed", "id", conn.RemoteID(), "err", err)
+				_ = conn.Close()
+			}
+		}()
 	}
 }
 
@@ -334,6 +358,13 @@ const maxPeerStreams = 64
 
 // dispatchLoop accepts data streams and routes them to features.
 func (m *Manager) dispatchLoop(p *Peer) {
+	// Long-lived per-peer goroutine: a panic in the accept/header path must
+	// not take the daemon down (the per-stream handlers already recover).
+	defer func() {
+		if r := recover(); r != nil {
+			m.log.Error("dispatch loop panic", "peer", p.ID, "panic", r)
+		}
+	}()
 	for {
 		s, err := p.conn.Accept()
 		if err != nil {

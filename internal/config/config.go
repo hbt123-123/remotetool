@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -192,7 +193,15 @@ func (s *Store) loadConfig() error {
 	}
 	if len(b) > 0 {
 		if err := json.Unmarshal(b, &s.cfg); err != nil {
-			return fmt.Errorf("parse %s: %w", path, err)
+			// A corrupt config.json must not wedge the daemon (it used to
+			// fail every start): move the file aside and reseed. The device
+			// identity lives in identity.key and survives; settings like the
+			// hub address and forward rules do not — the log says so.
+			if mvErr := quarantine(path, err); mvErr != nil {
+				return fmt.Errorf("parse %s: %w (and could not quarantine it: %v)", path, err, mvErr)
+			}
+			s.cfg = Config{}
+			dirty = true
 		}
 	}
 	if s.cfg.Name == "" {
@@ -231,7 +240,14 @@ func (s *Store) loadPeers() error {
 	}
 	var list []Peer
 	if err := json.Unmarshal(b, &list); err != nil {
-		return fmt.Errorf("parse %s: %w", path, err)
+		// Same recovery as config.json: quarantine the unreadable file and
+		// start from an empty peer table. Device identity (identity.key)
+		// survives; peers must re-pair, and the log points at the moved
+		// file so the old table is not silently gone.
+		if mvErr := quarantine(path, err); mvErr != nil {
+			return fmt.Errorf("parse %s: %w (and could not quarantine it: %v)", path, err, mvErr)
+		}
+		return nil
 	}
 	for _, p := range list {
 		s.peers[p.ID] = p
@@ -405,7 +421,11 @@ func (s *Store) TouchPeer(id, addr string, meta device.Meta) {
 		p.Caps = append([]string(nil), meta.Caps...)
 	}
 	s.peers[id] = p
-	_ = s.savePeersLocked()
+	if err := s.savePeersLocked(); err != nil {
+		// Every successful hello rewrites peers.json (LastSeen); a persisting
+		// write failure must at least be visible, or LastSeen silently rots.
+		slog.Warn("peers.json persist failed", "err", err)
+	}
 }
 
 func atomicWrite(path string, b []byte) error {
@@ -414,6 +434,18 @@ func atomicWrite(path string, b []byte) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// quarantine moves an unreadable store file aside (timestamped suffix) so the
+// next start proceeds from a clean state instead of failing on every boot.
+func quarantine(path string, cause error) error {
+	dst := path + ".corrupt-" + time.Now().Format("20060102-150405")
+	if err := os.Rename(path, dst); err != nil {
+		return err
+	}
+	slog.Warn("store file was unreadable; moved aside, starting fresh (paired devices may need re-pairing; the file keeps the old content)",
+		"file", path, "moved_to", dst, "err", cause)
+	return nil
 }
 
 func randHex(n int) string {

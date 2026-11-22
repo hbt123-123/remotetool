@@ -36,6 +36,29 @@ import (
 const partSuffix = ".rtpart"
 const pumpBuf = 256 << 10
 
+// Inbound transfer quotas: every recv entry holds an open part-file handle
+// plus hashing state, so one device cannot register unbounded receivers and
+// starve the daemon (term and fwd have their own caps; this is the filex
+// counterpart).
+const (
+	maxRecvPerPeer = 16
+	maxRecvTotal   = 64
+)
+
+// Inbound-transfer reaper knobs: an entry whose data stops flowing holds its
+// open file handle forever if the sender dies between xfer.push and the data
+// stream (or never opens one). Unlike term sessions there is no peer_down
+// hook to lean on — entries deliberately outlive reconnects so a transfer can
+// resume — so a reaper is the only cleanup path. The reaped entry keeps its
+// .rtpart file (finishInterrupted semantics) for the next attempt. Vars so
+// tests can shorten them.
+var (
+	reapInterval        = time.Minute
+	recvIdleTTL         = 30 * time.Minute
+	completeVerdictWait = 30 * time.Second
+	sizeWait            = 15 * time.Second // EOF waiting for the pull response size
+)
+
 // Progress reports transfer state to the UI.
 type Progress struct {
 	ID     string `json:"id"`
@@ -73,7 +96,9 @@ type Service struct {
 
 // NewService builds the filex feature.
 func NewService(log *slog.Logger) *Service {
-	return &Service{log: log, recv: map[string]*recvState{}}
+	s := &Service{log: log, recv: map[string]*recvState{}}
+	go s.reapLoop()
+	return s
 }
 
 // SetPeerAuth wires the per-peer authorization lookup (backed by the config
@@ -314,14 +339,7 @@ func (s *Service) AttachRPC(peer *session.Peer, rc *proto.RPCConn) {
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
 		}
-		s.mu.Lock()
-		rs := s.recv[p.ID]
-		s.mu.Unlock()
-		// Identical error for unknown id and foreign caller: no existence leak.
-		if rs == nil || rs.peerID != peer.ID {
-			return nil, fmt.Errorf("no such transfer %s", p.ID)
-		}
-		return nil, s.finalize(p.ID, p.Sha256)
+		return nil, s.complete(p.ID, p.Sha256, peer.ID)
 	})
 	rc.Handle("xfer.cancel", func(params json.RawMessage) (any, error) {
 		var p cancelParams
@@ -360,7 +378,9 @@ func (s *Service) listDir(path string) (*listResult, error) {
 	sort.Strings(names)
 	res := &listResult{Path: path, Entries: make([]entry, 0, len(names))}
 	for _, n := range names {
-		fi, err := os.Stat(filepath.Join(path, n))
+		// Lstat, not Stat: a symlink inside an authorized root must not leak
+		// the metadata of whatever outside target it points at.
+		fi, err := os.Lstat(filepath.Join(path, n))
 		if err != nil {
 			continue
 		}
@@ -433,12 +453,15 @@ type recvState struct {
 	size      int64 // may be 0 until known
 	sizeKnown bool
 	peerID    string // owning peer, fixed at prepareRecv time
-	finOnce   sync.Once
-	finDone   chan struct{}
-	finErr    error
-	ready     chan struct{} // closed once expected is set
-	readyOnce sync.Once
-	muSt      sync.Mutex
+	eofSeen    bool      // the data stream reached EOF (verdict may run)
+	lastAt     time.Time // last data flow / registration, feeds the reaper
+	finOnce    sync.Once
+	finDone    chan struct{}
+	finErr     error
+	ready      chan struct{} // closed once expected is set
+	readyOnce  sync.Once
+	settleOnce sync.Once // checksum verdict + rename runs exactly once
+	muSt       sync.Mutex
 }
 
 // prepareRecv sets up (or resumes) an inbound transfer. peerID is the
@@ -498,6 +521,7 @@ func (s *Service) prepareRecv(id, path string, size int64, sizeKnown bool, confl
 		id: id, finalPath: final, partPath: part, f: f,
 		hash: h, offset: offset, size: size, sizeKnown: sizeKnown,
 		peerID: peerID,
+		lastAt: time.Now(),
 		ready:  make(chan struct{}), finDone: make(chan struct{}),
 	}
 	s.mu.Lock()
@@ -508,11 +532,26 @@ func (s *Service) prepareRecv(id, path string, size int64, sizeKnown bool, confl
 			s.mu.Unlock()
 			return nil, fmt.Errorf("no such transfer %s", id)
 		}
+		// Same peer re-registering the id replaces its own entry in place
+		// (resume), so it does not add a new slot and quotas do not apply.
 		_ = old.f.Close()
+	} else {
+		total, mine := 0, 0
+		for _, r := range s.recv {
+			total++
+			if r.peerID == peerID {
+				mine++
+			}
+		}
+		if mine >= maxRecvPerPeer || total >= maxRecvTotal {
+			s.mu.Unlock()
+			_ = f.Close()
+			return nil, fmt.Errorf("too many inbound transfers (max %d per device, %d total)", maxRecvPerPeer, maxRecvTotal)
+		}
 	}
 	s.recv[id] = st
 	s.mu.Unlock()
-	s.progress(Progress{ID: id, Direction: "pull", LocalPath: final, Name: filepath.Base(final), Size: size, Done: offset, State: "running"})
+	s.progress(Progress{ID: id, PeerID: peerID, Direction: "pull", LocalPath: final, Name: filepath.Base(final), Size: size, Done: offset, State: "running"})
 	return &pushResult{Offset: offset, Path: final}, nil
 }
 
@@ -531,6 +570,14 @@ func (s *Service) HandleStream(peer *session.Peer, _ proto.Chan, h *proto.DataHe
 		_ = st.Close()
 		return
 	}
+	// Re-check the feature permission like term does on every stream attach:
+	// the operator may have revoked file access after xfer.push registered
+	// this transfer, and the stream must then stop too.
+	if _, allowed := s.authFor(peer.ID); !allowed {
+		s.log.Warn("file stream from revoked peer", "id", h.XferID, "peer", peer.ID)
+		_ = st.Close()
+		return
+	}
 
 	buf := make([]byte, pumpBuf)
 	lastReport := time.Now()
@@ -541,12 +588,13 @@ func (s *Service) HandleStream(peer *session.Peer, _ proto.Chan, h *proto.DataHe
 			_, werr := rs.f.Write(buf[:n])
 			rs.hash.Write(buf[:n])
 			rs.offset += int64(n)
+			rs.lastAt = time.Now()
 			done := rs.offset
 			size := rs.size
 			rs.muSt.Unlock()
 			if werr != nil {
 				_ = st.Close()
-				s.failRecv(rs.id, werr.Error())
+				s.failRecv(rs, werr.Error())
 				return
 			}
 			if time.Since(lastReport) > 400*time.Millisecond {
@@ -557,11 +605,12 @@ func (s *Service) HandleStream(peer *session.Peer, _ proto.Chan, h *proto.DataHe
 		if err != nil {
 			_ = st.Close()
 			rs.muSt.Lock()
-			complete := rs.sizeKnown && rs.offset >= rs.size
+			rs.eofSeen = true
 			rs.muSt.Unlock()
+			complete := s.streamComplete(rs)
 			if complete {
-				if ferr := s.finalize(rs.id, ""); ferr != nil && !errors.Is(ferr, errAwaitHash) {
-					s.failRecv(rs.id, ferr.Error())
+				if ferr := s.finalize(rs.id); ferr != nil && !errors.Is(ferr, errAwaitHash) {
+					s.failRecv(rs, ferr.Error())
 				}
 			} else {
 				// Incomplete stream: forget the entry but KEEP the part
@@ -570,7 +619,7 @@ func (s *Service) HandleStream(peer *session.Peer, _ proto.Chan, h *proto.DataHe
 				// used to linger with an open file handle and the pull
 				// hung until its 24h context timeout.
 				_ = rs.f.Close()
-				s.dropRecv(rs.id)
+				s.dropRecvIf(rs.id, rs)
 				s.finishInterrupted(rs)
 			}
 			return
@@ -578,57 +627,120 @@ func (s *Service) HandleStream(peer *session.Peer, _ proto.Chan, h *proto.DataHe
 	}
 }
 
+// streamComplete reports whether the stream delivered the whole file. The
+// xfer.pull response sets sizeKnown on a different QUIC stream than the data,
+// so EOF can arrive first: wait briefly for the size rather than judging an
+// actually-complete transfer as interrupted. Pushes know the size up front
+// (sizeKnown from xfer.push) and return immediately.
+func (s *Service) streamComplete(rs *recvState) bool {
+	deadline := time.Now().Add(sizeWait)
+	for {
+		rs.muSt.Lock()
+		known := rs.sizeKnown
+		complete := known && rs.offset >= rs.size
+		rs.muSt.Unlock()
+		if known {
+			return complete
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 var errAwaitHash = errors.New("waiting for checksum")
 
-// finalize renames the part file into place once the checksum is known.
-func (s *Service) finalize(id, expected string) error {
+// finalize runs once the data stream hit EOF: wait briefly for
+// xfer.complete to deliver the checksum, then settle the verdict.
+func (s *Service) finalize(id string) error {
 	s.mu.Lock()
 	rs := s.recv[id]
 	s.mu.Unlock()
 	if rs == nil {
 		return fmt.Errorf("no such transfer %s", id)
 	}
-	if expected != "" {
-		rs.muSt.Lock()
-		already := rs.expected != ""
-		if !already {
-			rs.expected = expected
-		}
-		rs.muSt.Unlock()
-		if already {
-			// Repeated xfer.complete for the same transfer: no-op success.
-			return nil
-		}
-		rs.readyOnce.Do(func() { close(rs.ready) })
-		return nil
-	}
-	// EOF path: wait briefly for xfer.complete to deliver the checksum.
 	select {
 	case <-rs.ready:
 	case <-time.After(15 * time.Second):
 		return errAwaitHash
 	}
-	rs.muSt.Lock()
-	want := rs.expected
-	got := hex.EncodeToString(rs.hash.Sum(nil))
-	rs.muSt.Unlock()
-	if want != got {
+	return s.settle(rs)
+}
+
+// settle runs the checksum verdict and places the file, exactly once — both
+// the EOF path (finalize) and a late xfer.complete (complete) can reach it,
+// and both may already have failed sibling paths behind them. Callers must
+// have confirmed the transfer is complete (sizeKnown && offset >= size).
+func (s *Service) settle(rs *recvState) error {
+	var verdict error
+	rs.settleOnce.Do(func() {
+		rs.muSt.Lock()
+		want := rs.expected
+		got := hex.EncodeToString(rs.hash.Sum(nil))
+		rs.muSt.Unlock()
+		if want == "" {
+			// Unreachable via the guarded callers (ready is only closed with
+			// expected set); fail safe rather than renaming an unverified file.
+			verdict = errors.New("missing checksum")
+			_ = rs.f.Close()
+			_ = os.Remove(rs.partPath)
+			s.dropRecvIf(rs.id, rs)
+			s.finish(rs, verdict)
+			return
+		}
+		if want != got {
+			_ = rs.f.Close()
+			_ = os.Remove(rs.partPath)
+			s.dropRecvIf(rs.id, rs)
+			s.finish(rs, fmt.Errorf("sha256 mismatch"))
+			s.log.Warn("sha256 mismatch", "file", rs.finalPath, "want", want, "got", got)
+			verdict = fmt.Errorf("sha256 mismatch for %s", rs.finalPath)
+			return
+		}
 		_ = rs.f.Close()
-		_ = os.Remove(rs.partPath)
-		s.dropRecv(id)
-		s.finish(rs, fmt.Errorf("sha256 mismatch"))
-		s.log.Warn("sha256 mismatch", "file", rs.finalPath, "want", want, "got", got)
-		return fmt.Errorf("sha256 mismatch for %s", rs.finalPath)
+		if err := os.Rename(rs.partPath, rs.finalPath); err != nil {
+			s.dropRecvIf(rs.id, rs)
+			s.finish(rs, err)
+			verdict = err
+			return
+		}
+		s.dropRecvIf(rs.id, rs)
+		s.finish(rs, nil)
+	})
+	return verdict
+}
+
+// complete records the sender's expected checksum and surfaces the verdict to
+// it: previously the comparison ran asynchronously after the stream's EOF, so
+// a sha256 mismatch left the sender reporting success while the receiver
+// deleted the part file. EOF and this RPC race on independent streams; the
+// verdict wait bounds that race.
+func (s *Service) complete(id, sha, peerID string) error {
+	s.mu.Lock()
+	rs := s.recv[id]
+	s.mu.Unlock()
+	// Identical error for unknown id and foreign caller: no existence leak.
+	if rs == nil || rs.peerID != peerID {
+		return fmt.Errorf("no such transfer %s", id)
 	}
-	_ = rs.f.Close()
-	if err := os.Rename(rs.partPath, rs.finalPath); err != nil {
-		s.dropRecv(id)
-		s.finish(rs, err)
-		return err
+	rs.muSt.Lock()
+	rs.expected = sha
+	eofSeen := rs.eofSeen
+	ready := rs.sizeKnown && rs.offset >= rs.size
+	rs.muSt.Unlock()
+	rs.readyOnce.Do(func() { close(rs.ready) })
+	if eofSeen && ready {
+		// The stream already hit EOF with the whole file in (the complete RPC
+		// won the race against it): run the verdict right here.
+		return s.settle(rs)
 	}
-	s.dropRecv(id)
-	s.finish(rs, nil)
-	return nil
+	select {
+	case <-rs.finDone:
+		return rs.finErr
+	case <-time.After(completeVerdictWait):
+		return fmt.Errorf("timed out waiting for the %s data stream", id)
+	}
 }
 
 func (s *Service) finish(rs *recvState, err error) {
@@ -655,14 +767,11 @@ func (s *Service) finishInterrupted(rs *recvState) {
 	})
 }
 
-func (s *Service) failRecv(id, msg string) {
-	s.mu.Lock()
-	rs := s.recv[id]
-	delete(s.recv, id)
-	s.mu.Unlock()
-	if rs == nil {
-		return
-	}
+// failRecv fails the transfer the given state belongs to. It drops the entry
+// by identity (dropRecvIf), not by id: if the sender re-registered the same
+// id meanwhile, the stale goroutine must not destroy the replacement.
+func (s *Service) failRecv(rs *recvState, msg string) {
+	s.dropRecvIf(rs.id, rs)
 	_ = rs.f.Close()
 	s.finish(rs, errors.New(msg))
 }
@@ -694,10 +803,42 @@ func (s *Service) CancelAll() {
 	}
 }
 
-func (s *Service) dropRecv(id string) {
+// dropRecvIf removes the entry for id only if it is still this exact state:
+// stale goroutines (an EOF racing a same-id re-register, a reaped transfer)
+// must not delete a replacement entry they were never meant to own.
+func (s *Service) dropRecvIf(id string, rs *recvState) {
 	s.mu.Lock()
-	delete(s.recv, id)
+	if s.recv[id] == rs {
+		delete(s.recv, id)
+	}
 	s.mu.Unlock()
+}
+
+// reapLoop drops inbound transfers that saw no data for recvIdleTTL. The
+// .rtpart file is kept (finishInterrupted semantics) so the next attempt
+// resumes from the received offset.
+func (s *Service) reapLoop() {
+	t := time.NewTicker(reapInterval)
+	defer t.Stop()
+	for now := range t.C {
+		s.mu.Lock()
+		var stale []*recvState
+		for id, rs := range s.recv {
+			rs.muSt.Lock()
+			idle := now.Sub(rs.lastAt)
+			rs.muSt.Unlock()
+			if idle >= recvIdleTTL {
+				stale = append(stale, rs)
+				delete(s.recv, id)
+			}
+		}
+		s.mu.Unlock()
+		for _, rs := range stale {
+			s.log.Warn("reaping idle inbound transfer", "id", rs.id, "file", rs.finalPath)
+			_ = rs.f.Close()
+			s.finishInterrupted(rs)
+		}
+	}
 }
 
 // notifyCancel asks the peer to drop its receive state for id (best effort):
@@ -713,12 +854,15 @@ func notifyCancel(peer *session.Peer, id string) {
 func uniquePath(p string) string {
 	ext := filepath.Ext(p)
 	base := strings.TrimSuffix(p, ext)
-	for i := 1; ; i++ {
+	// Bound the loop: a persistent non-NotExist stat error (EACCES…) would
+	// otherwise spin the calling RPC goroutine forever.
+	for i := 1; i <= 1000; i++ {
 		cand := fmt.Sprintf("%s (%d)%s", base, i, ext)
 		if _, err := os.Stat(cand); os.IsNotExist(err) {
 			return cand
 		}
 	}
+	return fmt.Sprintf("%s (%s)%s", base, time.Now().Format("20060102150405"), ext)
 }
 
 // ------------------------------------------------------------- client side ---
@@ -932,6 +1076,12 @@ func (s *Service) sendStream(peer *session.Peer, id, srcPath string, size, offse
 			s.log.Error("filex goroutine panic", "panic", r)
 		}
 	}()
+	// Re-check the feature permission on the goroutine too: the xfer.pull
+	// request checked it, but the operator may revoke file access in between.
+	if _, allowed := s.authFor(peer.ID); !allowed {
+		notifyCancel(peer, id) // unblock the requester's waiting PullFile
+		return
+	}
 	f, err := os.Open(srcPath)
 	if err != nil {
 		s.log.Warn("xfer.pull open failed", "path", srcPath, "err", err)

@@ -86,8 +86,12 @@ func TestResumeChecksumMismatchCleanupAndRetry(t *testing.T) {
 		&proto.DataHeader{XferID: "x1"}, st)
 
 	wrong := sha256.Sum256([]byte("not the payload"))
-	if err := s.finalize("x1", hex.EncodeToString(wrong[:])); err != nil {
-		t.Fatalf("xfer.complete with wrong checksum: %v", err)
+	// The mismatch must surface to the sender as a failed xfer.complete —
+	// previously the verdict ran after the RPC replied, so the sender saw
+	// success while the receiver deleted the part file.
+	err = s.complete("x1", hex.EncodeToString(wrong[:]), "devA")
+	if err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
+		t.Fatalf("xfer.complete with wrong checksum: err=%v, want sha256 mismatch", err)
 	}
 
 	// Mismatch cleanup: part file removed, receive state dropped, final file
@@ -122,7 +126,7 @@ func TestResumeChecksumMismatchCleanupAndRetry(t *testing.T) {
 	go s.HandleStream(&session.Peer{ID: "devA"}, proto.ChanFile,
 		&proto.DataHeader{XferID: "x2"}, st2)
 	want := sha256.Sum256(payload)
-	if err := s.finalize("x2", hex.EncodeToString(want[:])); err != nil {
+	if err := s.complete("x2", hex.EncodeToString(want[:]), "devA"); err != nil {
 		t.Fatalf("retry xfer.complete: %v", err)
 	}
 

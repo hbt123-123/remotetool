@@ -70,7 +70,12 @@ func (c *RPCConn) Serve() {
 			go c.serveRequest(m)
 		case m.Method != "" && m.ID == 0:
 			if c.OnNotify != nil {
-				c.OnNotify(m.Method, m.Params)
+				// Same isolation as serveRequest: a panicking notify handler
+				// runs on this read-loop goroutine and would kill the process.
+				func() {
+					defer func() { _ = recover() }()
+					c.OnNotify(m.Method, m.Params)
+				}()
 			}
 		}
 		select {
@@ -82,6 +87,16 @@ func (c *RPCConn) Serve() {
 }
 
 func (c *RPCConn) serveRequest(m *Message) {
+	// Top-level recover: every handler runs on its own goroutine here, so a
+	// panicking handler would otherwise take down the whole process. Report a
+	// generic error to the peer; panic details stay local.
+	defer func() {
+		if r := recover(); r != nil {
+			if werr := c.write(&Message{ID: m.ID, OK: false, Err: "internal error"}); werr != nil {
+				c.Close()
+			}
+		}
+	}()
 	var resp *Message
 	if h, ok := c.handlers.Load(m.Method); ok {
 		result, err := h.(Handler)(m.Params)

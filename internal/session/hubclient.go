@@ -45,9 +45,17 @@ type HubClient struct {
 	online   bool
 	ensuring map[string]*hubEnsure
 
+	// relaySem bounds concurrent inbound relay handshakes: the hub notifies
+	// us for every relay aimed at this device, and a hostile registered
+	// source could otherwise stack hundreds of TLS handshakes at once.
+	relaySem chan struct{}
+
 	closed    chan struct{} // set by Close: stops the KeepAlive loop
 	closeOnce sync.Once
 }
+
+// maxRelayAccepts caps concurrently accepted inbound relay handshakes.
+const maxRelayAccepts = 16
 
 // hubEnsure single-flights concurrent Ensure calls (mirrors Manager.dialCall).
 type hubEnsure struct {
@@ -74,6 +82,7 @@ func NewHubClient(id *identity.Identity, mgr *Manager, addr, token, hubPubkey st
 		hubPubkey: hubPubkey,
 		log:       log,
 		ensuring:  map[string]*hubEnsure{},
+		relaySem:  make(chan struct{}, maxRelayAccepts),
 		closed:    make(chan struct{}),
 	}
 }
@@ -168,11 +177,10 @@ func (h *HubClient) dialAndRegister(ctx context.Context) error {
 		return err
 	}
 	rc := proto.NewRPCConn(ctl)
-	go rc.Serve()
-	if err := rc.Call(ctx, "reg", hub.RegParams{Token: h.token, ID: h.id.ID}, nil); err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("hub register: %w", err)
-	}
+	// OnNotify must be installed before Serve starts: the read loop reads it
+	// without synchronization, and a relay.incoming for this device can race
+	// with the reg call (another device relaying to us right now) — late
+	// assignment is both a data race and a lost notify.
 	rc.OnNotify = func(method string, params json.RawMessage) {
 		if method == "relay.incoming" {
 			var inc hub.RelayIncoming
@@ -180,6 +188,16 @@ func (h *HubClient) dialAndRegister(ctx context.Context) error {
 				go h.acceptRelay(inc)
 			}
 		}
+	}
+	go rc.Serve()
+	// Bound the reg call even when the caller passed a background context
+	// (the KeepAlive path): a hub that accepts the connection but never
+	// answers RPCs must not wedge Ensure forever.
+	regCtx, regCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer regCancel()
+	if err := rc.Call(regCtx, "reg", hub.RegParams{Token: h.token, ID: h.id.ID}, nil); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("hub register: %w", err)
 	}
 
 	h.mu.Lock()
@@ -204,8 +222,15 @@ func (h *HubClient) Resolve(ctx context.Context, peerID string) (string, bool) {
 	h.mu.Lock()
 	rc := h.ctl
 	h.mu.Unlock()
+	if rc == nil {
+		// The connection dropped between Ensure and here (the cleanup
+		// goroutine nils these fields); resolve is best-effort.
+		return "", false
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	var res hub.ResolveResult
-	if err := rc.Call(ctx, "resolve", hub.ResolveParams{ID: peerID}, &res); err != nil {
+	if err := rc.Call(callCtx, "resolve", hub.ResolveParams{ID: peerID}, &res); err != nil {
 		return "", false
 	}
 	return res.Addr, res.Found
@@ -219,8 +244,13 @@ func (h *HubClient) Relay(ctx context.Context, peerID string) (transport.Conn, e
 		return nil, err
 	}
 	h.mu.Lock()
-	conn := h.conn
+	conn, rc := h.conn, h.ctl
 	h.mu.Unlock()
+	if conn == nil || rc == nil {
+		// Same drop race as Resolve — nil-dereferencing here panicked the
+		// web API's connect path on flaky networks.
+		return nil, errors.New("hub connection lost")
+	}
 
 	st, err := conn.Open()
 	if err != nil {
@@ -231,11 +261,12 @@ func (h *HubClient) Relay(ctx context.Context, peerID string) (transport.Conn, e
 		_ = st.Close()
 		return nil, err
 	}
-	// The RPC returns once both relay streams are paired at the hub.
-	h.mu.Lock()
-	rc := h.ctl
-	h.mu.Unlock()
-	if err := rc.Call(ctx, "relay", hub.RelayParams{Dst: peerID, Token: token}, nil); err != nil {
+	// The RPC returns once both relay streams are paired at the hub; the
+	// hub itself waits relayWaitTimeout (15s) for the pairing, so give the
+	// call slightly more than that.
+	callCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if err := rc.Call(callCtx, "relay", hub.RelayParams{Dst: peerID, Token: token}, nil); err != nil {
 		_ = st.Close()
 		return nil, err
 	}
@@ -244,6 +275,15 @@ func (h *HubClient) Relay(ctx context.Context, peerID string) (transport.Conn, e
 
 // acceptRelay answers an inbound relay request (we are the destination).
 func (h *HubClient) acceptRelay(inc hub.RelayIncoming) {
+	// Bound concurrent inbound handshakes; excess requests are dropped and
+	// the hub-side requester times out instead.
+	select {
+	case h.relaySem <- struct{}{}:
+		defer func() { <-h.relaySem }()
+	default:
+		h.log.Warn("too many concurrent relay requests; dropping", "src", inc.Src)
+		return
+	}
 	h.mu.Lock()
 	conn := h.conn
 	h.mu.Unlock()
@@ -301,17 +341,11 @@ func (h *HubClient) dropConn() {
 // Spawn it as a goroutine (daemon.Run does at startup and on hub config
 // changes; closing the replaced client stops the old loop).
 func (h *HubClient) KeepAlive(ctx context.Context) {
-	defer func() {
-		if r := recover(); r != nil {
-			h.log.Error("hub keepalive panic", "panic", r)
-		}
-	}()
 	backoff := hubReconnectBase
 	for {
-		err := h.Ensure(ctx)
+		err := h.ensureAndRefresh(ctx)
 		if err == nil {
 			backoff = hubReconnectBase
-			err = h.refreshLoop(ctx)
 		}
 		if ctx.Err() != nil {
 			return
@@ -336,6 +370,22 @@ func (h *HubClient) KeepAlive(ctx context.Context) {
 			backoff = hubReconnectMax
 		}
 	}
+}
+
+// ensureAndRefresh wraps one Ensure + refreshLoop pass. The recover lives
+// HERE, inside the loop: a function-level defer would let a panic end the
+// whole KeepAlive and the hub link would silently never reconnect again.
+func (h *HubClient) ensureAndRefresh(ctx context.Context) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			h.log.Error("hub keepalive panic", "panic", r)
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	if err := h.Ensure(ctx); err != nil {
+		return err
+	}
+	return h.refreshLoop(ctx)
 }
 
 // refreshLoop sends the registration refresh until the hub link drops or ctx

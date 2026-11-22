@@ -26,10 +26,18 @@ func (m *Manager) dialHandshake(ctx context.Context, conn transport.Conn, addr s
 		return nil, err
 	}
 	rc := proto.NewRPCConn(ctl)
-	go rc.Serve()
+	// Attach the pair handlers before Serve starts, like the accept path
+	// does: a request racing Serve's start would otherwise hit "no handler".
+	m.mu.Lock()
+	pa := m.pairAttach
+	m.mu.Unlock()
+	if pa != nil {
+		pa(conn, rc)
+	}
 	rc.Handle("hello", func(params json.RawMessage) (any, error) {
 		return m.myHello(), nil
 	})
+	go rc.Serve()
 	var their hello
 	hctx, cancel := context.WithTimeout(ctx, helloRPCTimeout)
 	defer cancel()
@@ -124,20 +132,21 @@ func (m *Manager) register(conn transport.Conn, rc *proto.RPCConn, addr string, 
 
 	m.mu.Lock()
 	features := append([]Feature{}, m.features...)
-	pa := m.pairAttach
+	// Glare or reconnect: keep the newest connection. The swap happens
+	// atomically under the lock — shutting the old connection down outside
+	// the lock (the old code did) left a window where a third concurrent
+	// register read the same `old`, and our insert then orphaned it.
+	var losers []*Peer
 	if old, ok := m.conns[peerID]; ok && old != p {
-		// Glare or reconnect: keep the newest connection.
-		m.mu.Unlock()
-		old.shutdown()
-		m.mu.Lock()
+		losers = append(losers, old)
 	}
 	m.conns[peerID] = p
 	m.mu.Unlock()
+	for _, old := range losers {
+		old.shutdown()
+	}
 	for _, f := range features {
 		f.AttachRPC(p, rc)
-	}
-	if pa != nil {
-		pa(conn, rc)
 	}
 	// Touch the peer with the hello's self-reported metadata. Relay sessions
 	// have no dialable address: pass "" so the stored LastAddr survives.

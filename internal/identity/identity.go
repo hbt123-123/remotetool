@@ -45,10 +45,17 @@ func LoadOrCreate(dir string) (*Identity, error) {
 	keyPath := filepath.Join(dir, "identity.key")
 	var seed []byte
 	if b, err := os.ReadFile(keyPath); err == nil {
-		seed = make([]byte, hex.DecodedLen(len(b)))
-		if _, err := hex.Decode(seed, trimSpace(b)); err != nil {
-			return nil, fmt.Errorf("parse %s: %w", keyPath, err)
+		// Tolerate trailing whitespace (hand-edited / echo-written files):
+		// size the buffer from the trimmed input and keep only the decoded
+		// bytes, or a "33 byte" seed makes the size check below fail with a
+		// misleading message.
+		hexed := trimSpace(b)
+		buf := make([]byte, hex.DecodedLen(len(hexed)))
+		n, derr := hex.Decode(buf, hexed)
+		if derr != nil {
+			return nil, fmt.Errorf("parse %s: %w", keyPath, derr)
 		}
+		seed = buf[:n]
 	} else if os.IsNotExist(err) {
 		seed = make([]byte, ed25519.SeedSize)
 		if _, err := rand.Read(seed); err != nil {

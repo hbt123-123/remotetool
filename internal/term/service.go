@@ -48,11 +48,15 @@ type Service struct {
 	mu       sync.Mutex
 	nextID   uint64
 	sessions map[uint64]*Session
+	// pending counts quota slots reserved by opens that are still spawning
+	// their PTY (startPTY is slow): without it, concurrent term.open calls
+	// all pass the quota check before any of them inserts its session.
+	pending map[string]int
 }
 
 // NewService builds the terminal feature and starts the idle-session reaper.
 func NewService(log *slog.Logger) *Service {
-	s := &Service{log: log, sessions: map[uint64]*Session{}}
+	s := &Service{log: log, sessions: map[uint64]*Session{}, pending: map[string]int{}}
 	go s.reapLoop()
 	return s
 }
@@ -178,7 +182,10 @@ func (s *Service) open(owner string, p openParams) (*openResult, error) {
 	if p.Rows == 0 {
 		p.Rows = 24
 	}
-	// Quota check before starting any PTY, so a rejected open costs nothing.
+	// Reserve a quota slot before starting any PTY: the check and the insert
+	// must not be separated by the (slow) shell spawn, or concurrent opens all
+	// pass the check and the quota never bites. The reservation is released on
+	// every path below (kept flips once it converts into a real session).
 	s.mu.Lock()
 	total, mine := 0, 0
 	for _, sess := range s.sessions {
@@ -187,11 +194,30 @@ func (s *Service) open(owner string, p openParams) (*openResult, error) {
 			mine++
 		}
 	}
+	for n, pend := range s.pending {
+		total += pend
+		if n == owner {
+			mine += pend
+		}
+	}
 	if mine >= maxSessionsPerOwner || total >= maxSessionsTotal {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("too many sessions (max %d per device, %d total)", maxSessionsPerOwner, maxSessionsTotal)
 	}
+	s.pending[owner]++
 	s.mu.Unlock()
+	kept := false
+	defer func() {
+		if kept {
+			return
+		}
+		s.mu.Lock()
+		s.pending[owner]--
+		if s.pending[owner] <= 0 {
+			delete(s.pending, owner)
+		}
+		s.mu.Unlock()
+	}()
 	pty, err := startPTY(p.Cols, p.Rows, p.Shell, p.Cwd)
 	if err != nil {
 		return nil, err
@@ -210,6 +236,13 @@ func (s *Service) open(owner string, p openParams) (*openResult, error) {
 		idleAt: time.Now(),
 	}
 	s.sessions[sess.ID] = sess
+	// Consume the reservation in the same critical section that inserts the
+	// session, so the slot is never double-counted as both.
+	kept = true
+	s.pending[owner]--
+	if s.pending[owner] <= 0 {
+		delete(s.pending, owner)
+	}
 	s.mu.Unlock()
 	go s.readLoop(sess)
 	go s.pump(sess)

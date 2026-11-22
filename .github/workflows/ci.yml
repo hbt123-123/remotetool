@@ -52,7 +52,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # fetch-depth: 0 so `git describe --tags` (build.sh version injection)
+      # resolves the real version instead of falling back to a constant.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:

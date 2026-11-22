@@ -79,12 +79,12 @@ func (s *Server) peerAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
-		peer, err := s.api.PairConnect(cctx, body.Addr, body.Code)
+		peer, alreadyPaired, err := s.api.PairConnect(cctx, body.Addr, body.Code)
 		if err != nil {
 			errJSON(w, err)
 			return
 		}
-		writeJSON(w, map[string]any{"ok": true, "peer": peer})
+		writeJSON(w, map[string]any{"ok": true, "peer": peer, "already_paired": alreadyPaired})
 
 	case r.URL.Path == "/api/peers/connect" && r.Method == http.MethodPost:
 		body, err := readBody[struct {

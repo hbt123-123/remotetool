@@ -128,7 +128,10 @@ type API struct {
 	ConnectPeer    func(ctx context.Context, id string) error
 	DisconnectPeer func(id string)
 	CreateInvite   func() (string, time.Time, error)
-	PairConnect    func(ctx context.Context, addr, code string) (any, error)
+	// PairConnect pairs (or fast-connects) a device. alreadyPaired reports
+	// the fast path: the target was paired and reachable, so the code was
+	// NOT verified and the UI must not claim a successful pairing.
+	PairConnect func(ctx context.Context, addr, code string) (peer any, alreadyPaired bool, err error)
 
 	ListDir func(ctx context.Context, peerArg, path string) (any, error)
 	Mkdir   func(ctx context.Context, peerArg, path string) error
@@ -391,6 +394,15 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(file, ".woff2"):
 		w.Header().Set("Content-Type", "font/woff2")
 	}
+	// Defense-in-depth headers for the local admin UI. connect-src 'self'
+	// covers fetch/EventSource/WebSocket; style-src needs unsafe-inline
+	// because generated markup uses style attributes.
+	h := w.Header()
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("X-Frame-Options", "DENY")
+	h.Set("Referrer-Policy", "no-referrer")
+	h.Set("Content-Security-Policy",
+		"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'")
 	w.Header().Set("Cache-Control", "no-cache")
 	_, _ = w.Write(b)
 }
@@ -522,7 +534,11 @@ func (s *Server) termWS(wsconn *websocket.Conn) {
 			}
 		}
 	}()
-	// browser -> remote; text frames are JSON resize commands
+	// browser -> remote; resize frames are "\x00{json}". The NUL prefix keeps
+	// a user literally typing `{"cols":100,"rows":30}` into the shell from
+	// being mistaken for a resize command (the old bare-JSON heuristic ate
+	// such input). Client and daemon ship in lockstep, so the protocol change
+	// rides the same release.
 	go func() {
 		defer func() { done <- struct{}{} }()
 		var msg []byte
@@ -530,12 +546,12 @@ func (s *Server) termWS(wsconn *websocket.Conn) {
 			if err := websocket.Message.Receive(wsconn, &msg); err != nil {
 				return
 			}
-			if len(msg) > 0 && msg[0] == '{' {
+			if len(msg) > 0 && msg[0] == 0 {
 				var cmd struct {
 					Cols uint16 `json:"cols"`
 					Rows uint16 `json:"rows"`
 				}
-				if json.Unmarshal(msg, &cmd) == nil && cmd.Cols > 0 && cmd.Rows > 0 {
+				if json.Unmarshal(msg[1:], &cmd) == nil && cmd.Cols > 0 && cmd.Rows > 0 {
 					_ = resize(cmd.Cols, cmd.Rows)
 					continue
 				}

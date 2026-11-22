@@ -76,8 +76,13 @@ type grantParams struct {
 	TargetPort int    `json:"target_port"`
 }
 
-// maxGrants caps the dial-consent table per device.
-const maxGrants = 256
+// maxGrants caps the dial-consent table overall, maxGrantsPerPeer bounds one
+// device's share of it, so one peer cannot fill the table and lock out the
+// others.
+const (
+	maxGrants        = 256
+	maxGrantsPerPeer = 64
+)
 
 // dialTimeout bounds the outbound dial for every forwarded connection.
 const dialTimeout = 10 * time.Second
@@ -216,6 +221,7 @@ func (s *Service) AttachRPC(peer *session.Peer, rc *proto.RPCConn) {
 	go func(peerID string, gen uint64) {
 		<-rc.Done()
 		s.dropGrantsGen(peerID, gen)
+		s.stopPeerListeners(peerID)
 		s.mu.Lock()
 		for id, st := range s.status {
 			if st.PeerID == peerID && st.Active {
@@ -225,6 +231,29 @@ func (s *Service) AttachRPC(peer *session.Peer, rc *proto.RPCConn) {
 		}
 		s.mu.Unlock()
 	}(peer.ID, gen)
+}
+
+// stopPeerListeners closes every local listener created by peerID's
+// connection (its mode L rules, and mode R listeners we open at its
+// request). The grant table drops per generation on disconnect; the same
+// lifecycle applies to listeners — without this, a peer that never
+// reconnects keeps its ports bound here forever, and after a reconnect the
+// stale listener cannot be torn down via fwd.unlisten (the new connection is
+// a different *session.Peer). peer_up re-applies persisted rules, so
+// still-valid rules come back automatically.
+func (s *Service) stopPeerListeners(peerID string) {
+	s.mu.Lock()
+	var stale []*ruleListener
+	for id, rl := range s.listeners {
+		if rl.peer != nil && rl.peer.ID == peerID {
+			stale = append(stale, rl)
+			delete(s.listeners, id)
+		}
+	}
+	s.mu.Unlock()
+	for _, rl := range stale {
+		_ = rl.ln.Close() // acceptLoop ends via the listener close
+	}
 }
 
 // HandleStream pipes one forwarded connection. The dial target never travels
@@ -306,8 +335,22 @@ func (s *Service) nextGen(peerID string) uint64 {
 func (s *Service) addGrant(id, peerID, targetHost string, targetPort int, gen uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.grants[id]; !ok && len(s.grants) >= maxGrants {
-		return fmt.Errorf("too many fwd grants")
+	if old, ok := s.grants[id]; ok {
+		// Only the grant's own device may refresh it; a foreign overwrite is
+		// refused with the generic wording (no existence leak).
+		if old.PeerID != peerID {
+			return fmt.Errorf("no such rule")
+		}
+	} else {
+		mine := 0
+		for _, g := range s.grants {
+			if g.PeerID == peerID {
+				mine++
+			}
+		}
+		if mine >= maxGrantsPerPeer || len(s.grants) >= maxGrants {
+			return fmt.Errorf("too many fwd grants")
+		}
 	}
 	s.grants[id] = &grantEntry{TargetHost: targetHost, TargetPort: targetPort, PeerID: peerID, gen: gen}
 	return nil

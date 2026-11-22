@@ -86,7 +86,10 @@
   配置，见 §8），被收权的设备得到与“会话不存在”相同的措辞——权限缺失与
   资源缺失不可区分。
 - 前端 xterm.js（vendor 本地化，无 CDN）；CLI `rt term` 原始模式
-  （unix SIGWINCH / windows 轮询 resize）。
+  （unix SIGWINCH / windows 轮询 resize）。resize 帧为 `\x00{json}` 文本帧：
+  NUL 前缀使终端里手工输入的 `{"cols":…}` 不会被误判为命令（UI/CLI/守护
+  进程同版发布）。会话配额（每设备 16 / 全局 32）在 PTY 孵化前预留槽位，
+  并发 open 无法绕过；无人使用的会话由 reaper 按 30 分钟空闲回收。
 
 ## 5. 文件传输（`internal/filex`）
 
@@ -99,11 +102,17 @@
    覆盖全文件）；
 4. **complete**：`xfer.complete {id, sha256}`，接收端等齐 EOF 与校验和
    （两事件无顺序保证，用 ready 通道合并），校验通过原子改名落盘；
-   不完整时保留 `.rtpart` 供续传，校验失败/取消时删除。
+   不完整时保留 `.rtpart` 供续传，校验失败/取消时删除。**校验结论作为
+   complete 的 RPC 结果返回发送端**——mismatch 时发送方收到失败而非
+   假成功（EOF 与 complete 竞态由有界等待收敛）。
+   接收条目有配额（每设备 16 / 全局 64）且由 reaper 按 30 分钟空闲回收
+   （保留 `.rtpart`，interrupted 语义），发送方只注册不开流不再无限占用
+   文件句柄。
 5. **失败清理**：发送端早期失败（本地文件打不开、数据流建立失败）会向对端
    发送 `xfer.cancel`（5s 上限）回收接收状态；接收端中断（EOF 早于 size）
    释放接收条目并保留 `.rtpart`，事件为 `interrupted` 状态（CLI 视为终态
    退出，重试自动续传）。两侧取消事件的 `Err` 统一为 `"canceled"`。
+   权限收权对数据流同样生效：流挂接/发送 goroutine 均复查 `peerAuth`。
    Web UI 的“本机”面板以空 `peer` 走本地 fs 处理器（`peer == ""` 不参与
    设备解析，杜绝空前缀命中第一个配对设备的误路由）。
 
@@ -127,6 +136,10 @@ fs 浏览操作：`fs.list/mkdir/rename/remove/stat`。目录推送：`filepath.
 - **自建 hub**（`cmd/hub` + `internal/hub` + `internal/session/hubclient.go`）：
   - 设备→hub：QUIC（ALPN `rtd-hub/1`），`reg {token, id}` 注册、
     `refresh` 幂等注册刷新、`resolve` 地址解析、`relay` 中继请求；
+  - **连接准入**：总连接数上限（1024），未注册连接 30 秒内未 reg 即关闭
+    （transport 的 KeepAlive 会把空闲连接永久保活，无此门槛则公网 hub 可被
+    僵尸连接耗尽）；`resolve`/`relay` 各有每设备令牌桶（10/s×20、2/s×8），
+    token 比较为常量时间；
   - **注册 TTL**：注册 5 分钟无 refresh 即被摘除（resolve/relay 均不再应答，
     后台 janitor 关闭其连接），设备假死不再长期占表；客户端每 60s refresh
     一次，断线后由 KeepAlive 循环指数退避（1s→5min）自动重连；
@@ -162,7 +175,9 @@ fs 浏览操作：`fs.list/mkdir/rename/remove/stat`。目录推送：`filepath.
 - [x] 未配对设备只在存在有效邀请时进入配对路径，否则拒绝
 - [x] 中继只见密文（内层 TLS）
 - [x] Web UI 仅回环 + token；cookie 认证的写请求校验 Origin（CSRF）；
-      SSE 认证走 HttpOnly cookie，token 不再进 URL
+      浏览器路径经 `?t=`→302→HttpOnly cookie，地址栏不留 token；本机
+      CLI 的 SSE/WS 以 query token 认证（不经浏览器，token 只进控制台
+      不进 rtd.log）；静态资源带 CSP/nosniff/X-Frame-Options
 - [x] 转发规则本地落盘，监听默认 127.0.0.1
 - [x] 设备权限开关（`Peer.Perm`）：终端/文件/转发可按设备关闭，
       拒绝话术与资源不存在一致（无存在性泄露）
@@ -172,7 +187,9 @@ fs 浏览操作：`fs.list/mkdir/rename/remove/stat`。目录推送：`filepath.
       获本机授权（主机/IP/CIDR），默认仅回环
 - [x] 凭据不入日志：web token 的完整 URL 只打印到控制台，rtd.log 不落
       token；web 层测试断言日志无凭据
-- [ ] hub 多租户隔离 / 速率限制（单用户自建场景暂不需要）
+- [x] hub 连接准入（总数上限 + 未注册连接超时踢出）与 resolve/relay
+      每设备令牌桶（单用户自建场景）
+- [ ] hub 多租户隔离 / 多 token（单用户自建场景暂不需要）
 
 ## 9. 验证记录（2026-11-07，本机双实例 + hub）
 

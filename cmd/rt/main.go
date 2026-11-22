@@ -358,8 +358,14 @@ func cmdCp(args []string) error {
 	// A side is remote only when the text before its first colon names a
 	// paired device; a Windows local path (C:\data\f.zip) matches no device
 	// and stays local.
-	srcDev, srcPath, srcRemote := resolveRemotePrefix(c, src)
-	dstDev, dstPath, dstRemote := resolveRemotePrefix(c, dst)
+	srcDev, srcPath, srcRemote, err := resolveRemotePrefix(c, src)
+	if err != nil {
+		return err
+	}
+	dstDev, dstPath, dstRemote, err := resolveRemotePrefix(c, dst)
+	if err != nil {
+		return err
+	}
 	if srcRemote == dstRemote {
 		return fmt.Errorf("exactly one side must be <device>:<path>")
 	}
@@ -411,34 +417,35 @@ func listPeers(c *client) ([]peerEntry, error) {
 
 // resolveRemotePrefix decides whether s is "<device>:<remote path>" and
 // splits it. The candidate prefix (text before the first colon) counts as a
-// device only if it matches a paired device's name exactly (case-insensitive)
-// or is a prefix of its device id. A single-letter candidate is treated as a
-// Windows drive letter and never matches an id prefix (hex ids can start
-// with any letter, so "C:\..." must not match an id starting with 'c').
-// ok is false when s is local — or when the peer list cannot be fetched.
-func resolveRemotePrefix(c *client, s string) (dev, rest string, ok bool) {
+// device only if it is longer than one character — a single letter is a
+// Windows drive letter, never a device name or id prefix (hex ids can start
+// with any letter, so "C:\..." must not match either). A peer-list fetch
+// failure is returned as an error: reporting "not a remote path" instead
+// would mislead (the real problem is the daemon being unreachable).
+func resolveRemotePrefix(c *client, s string) (dev, rest string, ok bool, err error) {
 	i := strings.Index(s, ":")
 	if i <= 0 {
-		return "", "", false
+		return "", "", false, nil
 	}
 	prefix, rest := s[:i], s[i+1:]
-	peers, err := listPeers(c)
-	if err != nil {
-		return "", "", false
+	if len(prefix) <= 1 {
+		return "", "", false, nil
+	}
+	peers, perr := listPeers(c)
+	if perr != nil {
+		return "", "", false, fmt.Errorf("cannot resolve %q: daemon unreachable: %w", prefix, perr)
 	}
 	for _, p := range peers {
 		if p.Name != "" && strings.EqualFold(prefix, p.Name) {
-			return prefix, rest, true
+			return prefix, rest, true, nil
 		}
 	}
-	if len(prefix) > 1 {
-		for _, p := range peers {
-			if strings.HasPrefix(strings.ToLower(p.ID), strings.ToLower(prefix)) {
-				return prefix, rest, true
-			}
+	for _, p := range peers {
+		if strings.HasPrefix(strings.ToLower(p.ID), strings.ToLower(prefix)) {
+			return prefix, rest, true, nil
 		}
 	}
-	return "", "", false
+	return "", "", false, nil
 }
 
 // sseClient has no global Timeout: /api/events is a long-lived SSE stream and
@@ -519,7 +526,19 @@ func watchProgress(c *client, xferID string) error {
 			return fmt.Errorf("%s", ev.Data.Err)
 		}
 	}
-	return sc.Err()
+	if err := sc.Err(); err != nil {
+		return err
+	}
+	// The stream ended WITHOUT a terminal event: the daemon stopped or the
+	// connection broke mid-transfer. That is not a success — exit non-zero
+	// so scripts do not read a silent exit 0 as "transfer finished" (the
+	// transfer itself may still be running on the daemon; rerun to reattach
+	// and resume).
+	what := xferID
+	if what == "" {
+		what = "transfer"
+	}
+	return fmt.Errorf("progress stream ended before the transfer finished (%s)", what)
 }
 
 func humanBytes(n int64) string {
@@ -606,8 +625,28 @@ func cmdFwd(args []string) error {
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		if fs.NArg() != 1 {
-			return fmt.Errorf("usage: rt fwd add <device> -L port:targetHost:targetPort | -R ...")
+		// flag.FlagSet stops at the first non-flag argument, so the documented
+		// `rt fwd add <device> -L ...` order leaves the device AND the flags
+		// unparsed in fs.Args(). Accept both orders: take the device from the
+		// front and re-parse the rest as flags.
+		usage := fmt.Errorf("usage: rt fwd add <device> -L port:targetHost:targetPort | -R ...")
+		var device string
+		switch {
+		case fs.NArg() == 1:
+			device = fs.Arg(0)
+		case fs.NArg() > 1:
+			device = fs.Arg(0)
+			if err := fs.Parse(fs.Args()[1:]); err != nil {
+				return err
+			}
+			if fs.NArg() != 0 {
+				return usage
+			}
+		default:
+			return usage
+		}
+		if *local == "" && *remote == "" {
+			return usage
 		}
 		spec, mode := *local, "L"
 		if *remote != "" {
@@ -616,7 +655,7 @@ func cmdFwd(args []string) error {
 			}
 			spec, mode = *remote, "R"
 		}
-		rule, err := parseFwdSpec(spec, mode, fs.Arg(0))
+		rule, err := parseFwdSpec(spec, mode, device)
 		if err != nil {
 			return err
 		}

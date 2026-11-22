@@ -6,9 +6,14 @@
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
 
-let TOKEN = localStorage.getItem("rt_token") || "";
+// The access token lives in memory only (typed into the gate, or a fallback
+// from a ?t= URL). Persistent authentication is the HttpOnly rt_token cookie
+// the server seeds on the ?t= handoff and refreshes on every authenticated
+// response — a localStorage copy would be a second, script-readable
+// credential that outlives the session.
+let TOKEN = "";
 const qs = new URLSearchParams(location.search);
-if (qs.get("t")) { TOKEN = qs.get("t"); localStorage.setItem("rt_token", TOKEN); history.replaceState(null, "", location.pathname); }
+if (qs.get("t")) { TOKEN = qs.get("t"); history.replaceState(null, "", location.pathname); }
 
 async function api(method, path, body) {
   const opt = { method, headers: {} };
@@ -111,7 +116,7 @@ const state = {
   terms: [],             // {id, peer, session, state, term, ws, fit, pane, retries, ...}
   activeTerm: null,
   termSeq: 0,
-  termGone: new Set(),   // "peer:session" the user dismissed; never restored
+  termGone: new Map(),   // "peer:session" the user dismissed; never restored (insertion-ordered for capping)
   activity: [],          // most recent last
 };
 
@@ -132,7 +137,8 @@ async function tryGate(silent) {
   TOKEN = $("#gate-token").value.trim() || TOKEN;
   try {
     await api("GET", "/api/status");
-    localStorage.setItem("rt_token", TOKEN);
+    // The server seeded the rt_token cookie on this authenticated response;
+    // nothing else to persist (and deliberately nothing in localStorage).
     $("#gate").classList.add("hidden");
     $("#app").classList.remove("hidden");
     boot();
@@ -184,6 +190,9 @@ function connectEvents() {
     }
   };
   es.onerror = () => { /* EventSource auto-reconnects */ };
+  // Events emitted while the stream was down are lost forever (activity is
+  // only fetched once at boot): re-fetch on reconnect so the log heals.
+  es.onopen = () => { loadActivity(); };
 }
 
 async function refreshStatus() {
@@ -409,7 +418,9 @@ $("#pair-btn").addEventListener("click", async () => {
   try {
     const res = await api("POST", "/api/pair/connect", { addr, code });
     msg.textContent = "";
-    toast("已配对 " + (res.peer?.name || ""));
+    toast(res.already_paired
+      ? "已连接 " + (res.peer?.name || "") + "（此前已配对，未校验配对码）"
+      : "已配对 " + (res.peer?.name || ""));
     $("#pair-addr").value = ""; $("#pair-code").value = "";
     refreshStatus();
   } catch (e) { msg.textContent = ""; toast(e.message, true); }
@@ -667,6 +678,28 @@ function openTerm(peerID, sessionID) {
   pane._ts = ts;
   state.terms.push(ts);
 
+  // Register input handlers once per Terminal, not per dial: xterm's onData/
+  // onResize are additive listeners, and reconnects re-enter dialTerm, so
+  // registering there would send every keystroke N times after N reconnects.
+  // The closures read ts.ws at call time, so they survive reconnects as-is.
+  // Report PTY resizes back: resize frames are "\x00{json}" text frames
+  // (the NUL prefix keeps typed JSON from being mistaken for a command), so
+  // window resizes and tab switches reach the remote shell.
+  ts.term.onResize(({ cols: c, rows: r }) => {
+    if (ts.ws && ts.ws.readyState === 1) ts.ws.send("\x00" + JSON.stringify({ cols: c, rows: r }));
+  });
+  ts.term.onData((d) => { if (ts.ws && ts.ws.readyState === 1) ts.ws.send(d); });
+  ts.term.attachCustomKeyEventHandler((e) => {
+    if (e.type !== "keydown") return true;
+    const k = (e.key || "").toLowerCase();
+    if (e.ctrlKey && e.shiftKey && k === "c") { copySel(ts); return false; }
+    if (e.ctrlKey && !e.shiftKey && k === "insert") { copySel(ts); return false; }
+    // Ctrl+V and Ctrl+Shift+V both paste; Shift+Insert too.
+    if (e.ctrlKey && k === "v") { pasteClip(ts); return false; }
+    if (e.shiftKey && k === "insert") { pasteClip(ts); return false; }
+    return true;
+  });
+
   dialTerm(ts, cols, rows);
   renderTermTabs();
   activateTerm(ts);
@@ -725,22 +758,6 @@ function dialTerm(ts, cols, rows) {
     if (ts.manualClose || ts.state === "dead" || !state.terms.includes(ts)) return;
     scheduleTermReconnect(ts);
   };
-  // Report PTY resizes back: the server accepts {"cols":N,"rows":N} text
-  // frames, so window resizes and tab switches reach the remote shell.
-  ts.term.onResize(({ cols: c, rows: r }) => {
-    if (ts.ws && ts.ws.readyState === 1) ts.ws.send(JSON.stringify({ cols: c, rows: r }));
-  });
-  ts.term.onData((d) => { if (ts.ws && ts.ws.readyState === 1) ts.ws.send(d); });
-  ts.term.attachCustomKeyEventHandler((e) => {
-    if (e.type !== "keydown") return true;
-    const k = (e.key || "").toLowerCase();
-    if (e.ctrlKey && e.shiftKey && k === "c") { copySel(ts); return false; }
-    if (e.ctrlKey && !e.shiftKey && k === "insert") { copySel(ts); return false; }
-    // Ctrl+V and Ctrl+Shift+V both paste; Shift+Insert too.
-    if (e.ctrlKey && k === "v") { pasteClip(ts); return false; }
-    if (e.shiftKey && k === "insert") { pasteClip(ts); return false; }
-    return true;
-  });
 }
 
 function setTermState(ts, st) {
@@ -877,7 +894,19 @@ function removeTermTab(ts) {
   state.terms = state.terms.filter((x) => x !== ts);
   // A dismissed tab whose remote session may still be alive must not pop up
   // again on the next page visit.
-  if (ts.session) state.termGone.add(ts.peer + ":" + ts.session);
+  if (ts.session) {
+    state.termGone.set(ts.peer + ":" + ts.session, true);
+    // Bound the memory: drop the OLDEST dismissals past the cap (Map
+    // iterates in insertion order). A pruned entry only means a long-gone
+    // dismissed tab may be offered for restore again after a refresh.
+    if (state.termGone.size > 500) {
+      let drop = state.termGone.size - 400;
+      for (const k of state.termGone.keys()) {
+        if (drop-- <= 0) break;
+        state.termGone.delete(k);
+      }
+    }
+  }
   if (state.activeTerm === ts) {
     state.activeTerm = null;
     const rest = state.terms.filter((t) => t.state !== "dead");
@@ -1113,7 +1142,17 @@ function onXferEvent(p) {
     p._t = Date.now();
   }
   state.xfers.set(p.id, p);
+  pruneXfers();
   renderXfers();
+}
+
+// pruneXfers bounds the transfer map: finished entries accumulate on a
+// long-lived page (one per transfer), so past a cap the oldest TERMINAL
+// entries are dropped — running transfers are never evicted.
+function pruneXfers() {
+  if (state.xfers.size <= 200) return;
+  const terminal = [...state.xfers.entries()].filter(([, p]) => p.state !== "running");
+  for (let i = 0; i < terminal.length - 150; i++) state.xfers.delete(terminal[i][0]);
 }
 
 function renderXfers() {

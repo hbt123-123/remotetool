@@ -56,6 +56,7 @@ type Daemon struct {
 
 	events    *web.EventHub
 	hubMu     sync.Mutex
+	hubCtx    context.Context // governs hub keepalive goroutines; set in Run
 	hubClient *session.HubClient
 }
 
@@ -180,8 +181,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.log.Info("listening", "port", cfg.ListenPort, "web", cfg.WebPort)
 	go d.mgr.ServeListener(ln)
 
+	// hubCtx governs hub keepalive goroutines for the daemon's lifetime: a
+	// hub configured later through the web API (SetHub has no request
+	// context) must still stop when the daemon shuts down.
+	hubCtx, hubCancel := context.WithCancel(ctx)
+	d.hubMu.Lock()
+	d.hubCtx = hubCtx
+	d.hubMu.Unlock()
+
 	// Optional self-hosted hub (signaling + encrypted relay for WAN).
-	d.applyHub(ctx, cfg.HubAddr, cfg.HubToken)
+	d.applyHub(hubCtx, cfg.HubAddr, cfg.HubToken)
 
 	// LAN discovery.
 	mdns, err := discover.Start(d.log, d.id.ID, cfg.Name, d.self.Platform, cfg.ListenPort, func(e discover.Entry) {
@@ -215,6 +224,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	case <-ctx.Done():
 		d.log.Info("shutting down")
 		_ = ln.Close()
+		hubCancel()
 		// Order matters: kill PTYs first so no child shell outlives the
 		// daemon, then abort in-flight transfers, then close local forward
 		// listeners. The web server stops via its own ctx (3s grace).
@@ -223,8 +233,24 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.fwd.StopAll()
 		return nil
 	case err := <-webErr:
+		// The web server failed: release the QUIC listener and the hub link
+		// too (main exits right after, but close what we own anyway).
+		_ = ln.Close()
+		hubCancel()
 		return err
 	}
+}
+
+// hubContext returns the context governing hub keepalive goroutines: derived
+// from the daemon lifetime in Run, or Background for an unwired daemon
+// (direct tests) before Run has started.
+func (d *Daemon) hubContext() context.Context {
+	d.hubMu.Lock()
+	defer d.hubMu.Unlock()
+	if d.hubCtx != nil {
+		return d.hubCtx
+	}
+	return context.Background()
 }
 
 // applyHub (re)connects the hub client after a config change.
@@ -449,7 +475,7 @@ func (d *Daemon) webAPI() *web.API {
 			if err != nil {
 				return err
 			}
-			d.applyHub(context.Background(), addr, token)
+			d.applyHub(d.hubContext(), addr, token)
 			return nil
 		},
 		Peers: func() any { return d.deviceViews() },
@@ -465,18 +491,21 @@ func (d *Daemon) webAPI() *web.API {
 		},
 		DisconnectPeer: d.mgr.Disconnect,
 		CreateInvite:   d.pair.CreateInvite,
-		PairConnect: func(ctx context.Context, addr, code string) (any, error) {
-			// Fast path: already paired and reachable — just connect.
+		PairConnect: func(ctx context.Context, addr, code string) (any, bool, error) {
+			// Fast path: already paired and reachable — just connect. The
+			// code is deliberately NOT verified (the target is already
+			// trusted); alreadyPaired=true tells the UI not to claim a
+			// successful pairing.
 			if p, err := d.mgr.ConnectAddr(ctx, addr); err == nil {
 				peer, _ := d.store.Peer(p.ID)
 				d.recordActivity("pair", p.ID, "已连接已配对设备")
-				return peer, nil
+				return peer, true, nil
 			}
 			peer, err := d.pair.PairWith(ctx, addr, code)
 			if err == nil && peer != nil {
 				d.recordActivity("pair", peer.ID, "配对成功")
 			}
-			return peer, err
+			return peer, false, err
 		},
 		ListDir: func(ctx context.Context, peerArg, path string) (any, error) {
 			if peerArg == "" {

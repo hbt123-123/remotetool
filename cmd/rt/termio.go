@@ -8,6 +8,13 @@ import (
 	"golang.org/x/term"
 )
 
+// wsWrite is one queued websocket frame: shell bytes are binary, resize
+// reports are text/JSON.
+type wsWrite struct {
+	text bool
+	data []byte
+}
+
 // runTermWS bridges local stdin/stdout to the daemon's terminal WebSocket.
 func runTermWS(u string) error {
 	ws, err := websocket.Dial(u, "", "http://127.0.0.1")
@@ -15,9 +22,26 @@ func runTermWS(u string) error {
 		return fmt.Errorf("terminal websocket: %w", err)
 	}
 	defer ws.Close()
-	ws.PayloadType = websocket.BinaryFrame
 
-	done := make(chan error, 2)
+	done := make(chan error, 3)
+	// Single writer goroutine: x/net/websocket tolerates exactly one
+	// concurrent writer, and the stdin and resize paths used to Write from
+	// two goroutines — interleaved frames corrupt the stream. The writer
+	// also owns PayloadType, which sendResize used to flip without any
+	// synchronization (a data race that left keyboard input on text frames).
+	writeCh := make(chan wsWrite, 8)
+	go func() {
+		for w := range writeCh {
+			ws.PayloadType = websocket.BinaryFrame
+			if w.text {
+				ws.PayloadType = websocket.TextFrame
+			}
+			if _, err := ws.Write(w.data); err != nil {
+				done <- err
+				return
+			}
+		}
+	}()
 	// remote -> stdout
 	go func() {
 		buf := make([]byte, 32<<10)
@@ -35,15 +59,20 @@ func runTermWS(u string) error {
 			}
 		}
 	}()
-	// stdin -> remote
+	// stdin -> writer channel
 	go func() {
 		buf := make([]byte, 4096)
 		for {
 			n, err := os.Stdin.Read(buf)
 			if n > 0 {
-				if _, werr := ws.Write(buf[:n]); werr != nil {
-					done <- werr
-					return
+				b := make([]byte, n)
+				copy(b, buf[:n])
+				select {
+				case writeCh <- wsWrite{data: b}:
+				default:
+					// Writer backed up or dead: the link is unhealthy either
+					// way — drop this chunk instead of stalling stdin (the
+					// read side surfaces the failure and ends the session).
 				}
 			}
 			if err != nil {
@@ -52,14 +81,20 @@ func runTermWS(u string) error {
 			}
 		}
 	}()
-	watchResize(ws)
+	watchResize(writeCh)
 
 	return <-done
 }
 
-func sendResize(ws *websocket.Conn, cols, rows uint16) {
-	ws.PayloadType = websocket.TextFrame
-	_, _ = ws.Write([]byte(fmt.Sprintf(`{"cols":%d,"rows":%d}`, cols, rows)))
+// sendResize queues a resize frame for the writer goroutine; it never blocks
+// the watcher (a skipped resize is recovered on the next size change). The
+// \x00 prefix marks a resize frame (see the daemon's termWS) so a shell user
+// typing raw JSON can never collide with it.
+func sendResize(ch chan<- wsWrite, cols, rows uint16) {
+	select {
+	case ch <- wsWrite{text: true, data: []byte("\x00" + fmt.Sprintf(`{"cols":%d,"rows":%d}`, cols, rows))}:
+	default:
+	}
 }
 
 // makeRaw switches the terminal to raw mode; returns restore func + size.

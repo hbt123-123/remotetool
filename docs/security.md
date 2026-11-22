@@ -64,13 +64,14 @@ Web UI 只监听 `127.0.0.1`（其他网卡根本不 bind），不在网络层�
 - **Web token 不写入日志**：token URL 只打印到 stderr 控制台，rtd.log
   里没有（有自动化测试守护这条）。
 - config.json（含 WebToken、hub token）与 identity.key 权限 0600，目录
-  0700；文件写入是临时文件+原子替换。
+  0700；文件写入是临时文件+原子替换。注意：**0600/0700 是 unix 语义**，
+  Windows 上 Go 的 perm 参数只影响只读位，实际隔离来自用户目录的默认
+  ACL（其他本机用户默认不可读），文件内容本身仍为明文。
 - hub token 保存在本机 config.json；VPS 上的 hub 用强随机 token。
 
 ## 已知缺口（当前版本）
 
-- **Web UI 未设 Content-Security-Policy** 响应头（静态资源无构建步骤，
-  已列入路线图）；
+- **日志无轮转**：rtd.log 追加不清理，长期运行注意磁盘（可手动删除）；
 - **日志无轮转**：rtd.log 追加不清理，长期运行注意磁盘（可手动删除）；
 - **无 UDP 打洞**：直连失败即走中继（功能性而非安全性）；
 - Android 平台为编译冒烟级，真机行为按 [platform-matrix](platform-matrix.md)

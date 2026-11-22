@@ -4,4 +4,3 @@ dist/
 *.log
 node_modules/
 .zcode/
-AGENTS.md

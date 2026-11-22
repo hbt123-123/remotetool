@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -83,15 +84,41 @@ func exeExt() string {
 var (
 	portMu sync.Mutex
 	portN  = 0
+	used   = map[int]bool{}
 )
 
-// AllocatePort hands out a distinct loopback port per call: every instance
-// and every forward listener gets its own, so tests never collide.
+// AllocatePort hands out a free loopback port per call: every instance and
+// every forward listener gets its own, so tests never collide. It probes the
+// OS (bind-and-close on 127.0.0.1:0) and never repeats a port within this
+// process — the old fixed counter handed the same first port to every test
+// binary, so `go test ./...` running packages in parallel fought over
+// 127.0.0.1:27401 and lost runs failed to bind. Cross-process collisions
+// shrink to the small window between probe and actual bind.
 func AllocatePort() int {
 	portMu.Lock()
 	defer portMu.Unlock()
-	portN++
-	return 27400 + portN
+	for i := 0; i < 100; i++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			break // OS probe unavailable: fall back to the fixed range
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		_ = ln.Close()
+		if !used[port] {
+			used[port] = true
+			return port
+		}
+	}
+	// Deterministic fallback (also guards against the OS repeatedly offering
+	// a port this process already handed out).
+	for {
+		portN++
+		p := 27400 + portN
+		if !used[p] {
+			used[p] = true
+			return p
+		}
+	}
 }
 
 // ------------------------------------------------------------ instance -----

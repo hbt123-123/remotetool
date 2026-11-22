@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"time"
 
@@ -360,6 +361,18 @@ func (ps *PairService) attachTo(conn transport.Conn, rc *proto.RPCConn) {
 		// self-reported metadata (fixes the Caps dead field: the exchange
 		// always carried caps, but they were never persisted).
 		peerID := conn.RemoteID()
+		// A relayed session reports a dummy remote address (the inner mux's
+		// placeholder): do not persist it — keep whatever dialable LastAddr
+		// a previous direct connection learned, or none at all. A stored
+		// placeholder would cost the next direct attempt its timeout.
+		lastAddr := addrOf(conn)
+		if _, _, hpErr := net.SplitHostPort(lastAddr); hpErr != nil {
+			if old, ok := ps.store.Peer(peerID); ok {
+				lastAddr = old.LastAddr
+			} else {
+				lastAddr = ""
+			}
+		}
 		err := ps.store.UpsertPeer(config.Peer{
 			ID:       peerID,
 			Name:     peerMeta.Name,
@@ -367,7 +380,7 @@ func (ps *PairService) attachTo(conn transport.Conn, rc *proto.RPCConn) {
 			Version:  peerMeta.Version,
 			Caps:     peerMeta.Caps,
 			PubKey:   conn.RemotePub(),
-			LastAddr: addrOf(conn),
+			LastAddr: lastAddr,
 		})
 		if err != nil {
 			return nil, err

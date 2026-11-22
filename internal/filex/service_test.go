@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"remotetool/internal/proto"
 	"remotetool/internal/session"
@@ -86,22 +87,28 @@ func testLogger() *slog.Logger {
 func TestFinalizeIdempotent(t *testing.T) {
 	s := NewService(testLogger())
 	s.OnProgress(func(Progress) {})
+	oldWait := completeVerdictWait
+	completeVerdictWait = 20 * time.Millisecond
+	t.Cleanup(func() { completeVerdictWait = oldWait })
 
 	dir := t.TempDir()
 	if _, err := s.prepareRecv("x1", filepath.Join(dir, "a.bin"), 0, false, "overwrite", "devA"); err != nil {
 		t.Fatalf("prepareRecv: %v", err)
 	}
-	if err := s.finalize("x1", "cafe"); err != nil {
-		t.Fatalf("first finalize: %v", err)
+	// xfer.complete without a data stream: no EOF verdict can arrive, so the
+	// bounded wait times out instead of reporting success silently.
+	err := s.complete("x1", "cafe", "devA")
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("complete without stream: err=%v, want verdict timeout", err)
 	}
-	// A repeated xfer.complete for a still-registered transfer must be a
-	// no-op success, not a close of the already-closed ready channel.
-	if err := s.finalize("x1", "cafe"); err != nil {
-		t.Fatalf("second finalize: %v", err)
+	// A repeated xfer.complete for a still-registered transfer must not
+	// panic on the already-closed ready channel.
+	if err := s.complete("x1", "cafe", "devA"); err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("repeated complete: err=%v, want verdict timeout", err)
 	}
-	err := s.finalize("gone", "cafe")
+	err = s.complete("gone", "cafe", "devA")
 	if err == nil || !strings.Contains(err.Error(), "no such transfer") {
-		t.Fatalf("finalize of unknown id: err=%v, want 'no such transfer'", err)
+		t.Fatalf("complete of unknown id: err=%v, want 'no such transfer'", err)
 	}
 	s.cancel("x1") // release the part file so TempDir cleanup works on Windows
 }
@@ -111,6 +118,12 @@ func TestForeignStreamRejected(t *testing.T) {
 	var progMu sync.Mutex
 	var progs []Progress
 	s.OnProgress(func(p Progress) { progMu.Lock(); progs = append(progs, p); progMu.Unlock() })
+	// The owner's stream below EOFs with sizeKnown=false (a pull-style
+	// register, where the size arrives on the RPC response): shorten that
+	// wait so the expected interrupted verdict is reached quickly.
+	oldSizeWait := sizeWait
+	sizeWait = 10 * time.Millisecond
+	t.Cleanup(func() { sizeWait = oldSizeWait })
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "a.bin")

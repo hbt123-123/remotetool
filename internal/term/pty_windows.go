@@ -106,6 +106,15 @@ func shellArgs(shell string) []string {
 	}
 }
 
+// quoteCmdToken wraps a command-line token in quotes when it contains
+// whitespace, per the standard CRT argv parsing rules.
+func quoteCmdToken(s string) string {
+	if strings.ContainsAny(s, " \t") {
+		return `"` + s + `"`
+	}
+	return s
+}
+
 // StartPTY launches a shell session.
 func StartPTY(cols, rows uint16, shell, cwd string) (PTY, error) {
 	if shell == "" {
@@ -180,9 +189,17 @@ func startConPTY(cols, rows uint16, shell, cwd string) (PTY, error) {
 	_ = inR.Close()
 	_ = outW.Close()
 
-	// Attribute list with one entry.
+	// Attribute list with one entry. The sizing call is expected to fail with
+	// ERROR_INSUFFICIENT_BUFFER while writing the required size; a zero size
+	// means it failed outright and would panic on &attr[0] below.
 	var listSize uintptr
 	_, _, _ = procInitAttrList.Call(0, 1, 0, uintptr(unsafe.Pointer(&listSize)))
+	if listSize == 0 {
+		_, _, _ = procClosePseudoConsole.Call(uintptr(hpc))
+		_ = inW.Close()
+		_ = outR.Close()
+		return nil, fmt.Errorf("InitializeProcThreadAttributeList: could not size attribute list")
+	}
 	attr := make([]byte, listSize)
 	r1, _, callErr = procInitAttrList.Call(uintptr(unsafe.Pointer(&attr[0])), 1, 0, uintptr(unsafe.Pointer(&listSize)))
 	if r1 == 0 {
@@ -217,9 +234,13 @@ func startConPTY(cols, rows uint16, shell, cwd string) (PTY, error) {
 		return nil, err
 	}
 	shellPtr, _ := windows.UTF16PtrFromString(shell)
-	cmdline := shell
+	// Quote the program path when it contains spaces (pwsh installs under
+	// "C:\Program Files\...") so the child's CRT parses argv[0] correctly;
+	// lpApplicationName gets the exact path, but lpCommandLine is what the
+	// shell's argument parser sees. shellArgs tokens are fixed and simple.
+	cmdline := quoteCmdToken(shell)
 	if args := shellArgs(shell); len(args) > 0 {
-		cmdline = shell + " " + strings.Join(args, " ")
+		cmdline += " " + strings.Join(args, " ")
 	}
 	cmdlinePtr, _ := windows.UTF16PtrFromString(cmdline)
 	var pi windows.ProcessInformation

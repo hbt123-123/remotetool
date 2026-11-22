@@ -57,6 +57,7 @@ func main() {
 
 	deadline := time.Now().Add(12 * time.Second)
 	var all []byte
+	probeOK := false
 	for time.Now().Before(deadline) {
 		select {
 		case b, ok := <-out:
@@ -67,6 +68,7 @@ func main() {
 		case <-time.After(100 * time.Millisecond):
 		}
 		if strings.Contains(string(all), "PROBE_DONE_") {
+			probeOK = true
 			time.Sleep(300 * time.Millisecond)
 			for {
 				select {
@@ -86,6 +88,12 @@ func main() {
 done:
 	text := stripANSI(string(all))
 	fmt.Println(text)
+	if !probeOK {
+		// Automation must be able to tell failure from success by exit code:
+		// no marker within the deadline (or a dead stream) is a failure.
+		fmt.Fprintln(os.Stderr, "probe failed: no PROBE_DONE_ marker within the deadline")
+		os.Exit(1)
+	}
 }
 
 func stripANSI(s string) string {

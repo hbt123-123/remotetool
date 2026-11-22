@@ -7,6 +7,7 @@
 package hub
 
 import (
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -33,10 +34,19 @@ const (
 	// maxDevices caps concurrently registered devices; excess registrations
 	// are rejected.
 	maxDevices = 256
-	// resolve rate limit per registered device: a tiny token bucket refilled
-	// at resolveRate tokens/s with burst capacity resolveBurst.
+	// maxConns caps total accepted connections, registered or not. Registered
+	// devices are bounded by maxDevices, but nothing stopped an open-ended
+	// pile of never-registered connections from exhausting memory on a
+	// public hub — the transport's KeepAlive would keep them alive forever.
+	maxConns = 1024
+	// resolve/relay rate limits per registered device: tiny token buckets
+	// (tokens/s refill, burst capacity). Relay is heavier than resolve — it
+	// opens streams on both sides and pokes the destination — so it gets a
+	// tighter budget.
 	resolveRate  = 10.0
 	resolveBurst = 20
+	relayRate    = 2.0
+	relayBurst   = 8
 )
 
 // deviceTTL bounds how long a registration stays answerable without a
@@ -45,6 +55,13 @@ const (
 // instead of lingering forever. Clients refresh well inside the TTL
 // (hubRefreshInterval). A var so tests can shorten it.
 var deviceTTL = 5 * time.Minute
+
+// regDeadline bounds how long a connection may stay unregistered before it
+// is closed. The transport config keeps idle connections alive with PINGs
+// (MaxIdleTimeout never fires), so without this a scanner could park
+// goroutines and QUIC state on the hub indefinitely. A var so tests can
+// shorten it.
+var regDeadline = 30 * time.Second
 
 // ---- u32-length JSON framing shared by hub and client ----
 
@@ -114,6 +131,41 @@ type RelayIncoming struct {
 
 // ---- server ----
 
+// rateBucket is a tiny token-bucket rate limiter (refill rate tokens/s up to
+// burst), one per connection and endpoint class.
+type rateBucket struct {
+	mu      sync.Mutex
+	rate    float64
+	burst   float64
+	tokens  float64
+	lastRef time.Time
+}
+
+func newRateBucket(rate, burst float64) *rateBucket {
+	return &rateBucket{rate: rate, burst: burst}
+}
+
+// allow reports whether one more request fits the budget.
+func (b *rateBucket) allow() bool {
+	now := time.Now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.lastRef.IsZero() {
+		b.lastRef = now
+		b.tokens = b.burst
+	}
+	b.tokens += now.Sub(b.lastRef).Seconds() * b.rate
+	if b.tokens > b.burst {
+		b.tokens = b.burst
+	}
+	b.lastRef = now
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
 type devConn struct {
 	conn transport.Conn
 	ctl  *proto.RPCConn
@@ -123,32 +175,10 @@ type devConn struct {
 	// server mutex (every read and write happens under s.mu).
 	lastSeen time.Time
 
-	// resolve token bucket (resolveRate/s refill, burst resolveBurst) so one
-	// device cannot hammer the hub's resolve endpoint.
-	rmu     sync.Mutex
-	tokens  float64
-	lastRef time.Time
-}
-
-// allowResolve reports whether another resolve request fits the rate limit.
-func (d *devConn) allowResolve() bool {
-	now := time.Now()
-	d.rmu.Lock()
-	defer d.rmu.Unlock()
-	if d.lastRef.IsZero() {
-		d.lastRef = now
-		d.tokens = resolveBurst
-	}
-	d.tokens += now.Sub(d.lastRef).Seconds() * resolveRate
-	if d.tokens > resolveBurst {
-		d.tokens = resolveBurst
-	}
-	d.lastRef = now
-	if d.tokens < 1 {
-		return false
-	}
-	d.tokens--
-	return true
+	// resolveLim / relayLim rate-limit the two expensive endpoints so one
+	// device cannot hammer the hub (see the resolveRate/relayRate consts).
+	resolveLim *rateBucket
+	relayLim   *rateBucket
 }
 
 // earlyEntry caches relay streams that arrive before the requester's "relay"
@@ -209,6 +239,7 @@ type Server struct {
 	pending      sync.Map     // token -> chan transport.Stream (buffer 2)
 	pendingCount atomic.Int64 // number of entries in pending
 	early        sync.Map     // token -> *earlyEntry, streams arriving before the relay RPC
+	connCount    atomic.Int64 // total accepted connections, registered or not
 }
 
 // NewServer builds a hub with the given shared token (empty = open to any
@@ -329,26 +360,55 @@ func (s *Server) serveConn(conn transport.Conn) {
 			s.Log.Error("hub goroutine panic", "where", "serveConn", "panic", r)
 		}
 	}()
+	// Total connection cap: registered devices are bounded by maxDevices,
+	// but an open-ended pile of pre-registration (or never-registering)
+	// connections would exhaust memory on a public hub.
+	if s.connCount.Add(1) > maxConns {
+		s.connCount.Add(-1)
+		s.Log.Warn("connection rejected: too many", "addr", conn.RemoteAddr().String())
+		_ = conn.Close()
+		return
+	}
+	defer s.connCount.Add(-1)
 	defer conn.Close()
 	ctl, err := conn.Accept()
 	if err != nil {
 		return
 	}
 	rc := proto.NewRPCConn(ctl)
-	var dev *devConn
+	// dev is published through an atomic pointer: handlers run on separate
+	// goroutines (proto.Serve dispatches one per request), so a plain local
+	// written by reg and read by refresh/resolve/relay would be a data race.
+	var devPtr atomic.Pointer[devConn]
+
+	// Unregistered connections must register within regDeadline or die: the
+	// transport's KeepAlive PINGs keep idle connections alive forever, so
+	// without this a scanner could park goroutines and QUIC state
+	// indefinitely without ever speaking the protocol.
+	regTm := time.AfterFunc(regDeadline, func() {
+		if devPtr.Load() == nil {
+			s.Log.Warn("closing connection that never registered", "addr", conn.RemoteAddr().String())
+			_ = conn.Close()
+		}
+	})
+	defer regTm.Stop()
 
 	rc.Handle("reg", func(params json.RawMessage) (any, error) {
 		var p RegParams
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
 		}
-		if s.Token != "" && p.Token != s.Token {
+		if s.Token != "" && subtle.ConstantTimeCompare([]byte(p.Token), []byte(s.Token)) != 1 {
 			return nil, fmt.Errorf("bad hub token")
 		}
 		if p.ID != conn.RemoteID() {
 			return nil, fmt.Errorf("registered id does not match certificate")
 		}
-		dev = &devConn{conn: conn, ctl: rc, addr: conn.RemoteAddr().String(), lastSeen: time.Now()}
+		d := &devConn{
+			conn: conn, ctl: rc, addr: conn.RemoteAddr().String(), lastSeen: time.Now(),
+			resolveLim: newRateBucket(resolveRate, resolveBurst),
+			relayLim:   newRateBucket(relayRate, relayBurst),
+		}
 		s.mu.Lock()
 		// Re-registering a known id replaces its entry and never counts
 		// against the cap, so reconnects keep working at capacity.
@@ -356,14 +416,16 @@ func (s *Server) serveConn(conn transport.Conn) {
 			s.mu.Unlock()
 			return nil, fmt.Errorf("too many devices")
 		}
-		s.devices[p.ID] = dev
+		s.devices[p.ID] = d
 		s.mu.Unlock()
-		s.Log.Info("device registered", "id", p.ID, "addr", dev.addr)
-		return RegResult{Addr: dev.addr}, nil
+		devPtr.Store(d)
+		s.Log.Info("device registered", "id", p.ID, "addr", d.addr)
+		return RegResult{Addr: d.addr}, nil
 	})
 	rc.Handle("refresh", func(_ json.RawMessage) (any, error) {
 		// Idempotent liveness ping: extends the registration TTL. The
 		// connection's certificate is the identity — nothing to unmarshal.
+		dev := devPtr.Load()
 		if dev == nil {
 			return nil, fmt.Errorf("register first")
 		}
@@ -379,10 +441,11 @@ func (s *Server) serveConn(conn transport.Conn) {
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
 		}
+		dev := devPtr.Load()
 		if dev == nil {
 			return nil, fmt.Errorf("register first")
 		}
-		if !dev.allowResolve() {
+		if !dev.resolveLim.allow() {
 			return nil, fmt.Errorf("slow down")
 		}
 		s.mu.Lock()
@@ -399,8 +462,16 @@ func (s *Server) serveConn(conn transport.Conn) {
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
 		}
+		dev := devPtr.Load()
 		if dev == nil {
 			return nil, fmt.Errorf("register first")
+		}
+		// Relay is the most expensive endpoint (streams on both sides plus a
+		// notify to the destination): rate-limit it like resolve, or one
+		// registered device can make the hub poke any other device at line
+		// rate and pin its CPU on pending handshakes.
+		if !dev.relayLim.allow() {
+			return nil, fmt.Errorf("slow down")
 		}
 		return nil, s.startRelay(dev, p)
 	})
@@ -442,7 +513,7 @@ func (s *Server) serveConn(conn transport.Conn) {
 		}
 	}
 
-	if dev != nil {
+	if dev := devPtr.Load(); dev != nil {
 		s.mu.Lock()
 		if cur := s.devices[conn.RemoteID()]; cur == dev {
 			delete(s.devices, conn.RemoteID())

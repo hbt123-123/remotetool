@@ -7,19 +7,19 @@ import (
 	"os/signal"
 	"syscall"
 
-	"golang.org/x/net/websocket"
 	"golang.org/x/term"
 )
 
-// watchResize reacts to SIGWINCH.
-func watchResize(ws *websocket.Conn) {
+// watchResize reacts to SIGWINCH and queues resize frames on the
+// single-writer channel.
+func watchResize(writeCh chan<- wsWrite) {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGWINCH)
 	go func() {
 		for range ch {
 			w, h, err := term.GetSize(int(os.Stdin.Fd()))
 			if err == nil && w > 0 && h > 0 {
-				sendResize(ws, uint16(w), uint16(h))
+				sendResize(writeCh, uint16(w), uint16(h))
 			}
 		}
 	}()
